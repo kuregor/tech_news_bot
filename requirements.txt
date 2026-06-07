@@ -1,0 +1,13 @@
+aiogram
+telethon
+sqlalchemy[asyncio]
+asyncpg
+aiohttp
+chromadb-client
+apscheduler
+redis
+pydantic-settings
+pydantic
+cerebras-cloud-sdk
+pytest
+pytest-asyncio

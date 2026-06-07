@@ -1,0 +1,89 @@
+services:
+
+  postgres:
+    image: postgres
+    container_name: psql
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tg_bot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "7610"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tg_bot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  chromadb:
+    image: chromadb/chroma:1.5.8.dev23
+    container_name: chromadb
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  bot:
+    build:
+      context: .
+      dockerfile: tech_news_bot.Dockerfile
+    image: tech_news_bot:${TAG:-latest}
+    container_name: tech_news_bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+      ollama:
+        condition: service_started
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:7610@postgres:5432/tg_bot
+      REDIS_URL: redis://redis:6379/0
+      EMBED_BASE_URL: http://ollama:11434
+      CHROMADB_URL: http://chromadb:8000
+    volumes:
+      - ./sessions:/app/sessions
+      - ./logs:/app/logs
+
+volumes:
+  postgres_data:
+  ollama_models:
+  chromadb_data:
