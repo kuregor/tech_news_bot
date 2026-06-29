@@ -8,7 +8,11 @@ from aiogram.fsm.context import FSMContext
 from bot.keyboards.inline import close_keyboard
 from bot.states import AnalyzeStates
 from bot.utils import not_a_command
-from core.analyzer import AnalyzerService
+from core.analyzer import (
+    format_analyze_result,
+    format_analyze_rich,
+    run_analyze_pipeline,
+)
 from db.session import async_session
 
 router = Router()
@@ -33,28 +37,51 @@ async def _run_analysis(message: types.Message, username: str) -> None:
 
     try:
         async with async_session() as session:
-            result = await AnalyzerService.run_analyze_pipeline(
+            result = await run_analyze_pipeline(
                 session, username, progress_callback=update_progress
             )
 
-        formatted = AnalyzerService.format_analyze_result(result)
+        formatted = format_analyze_result(result)
+        rich_html = format_analyze_rich(result)
         try:
             await progress_msg.delete()
         except Exception:
             pass
-        await message.answer(formatted, parse_mode="HTML")
+
+        # rich-сообщение (Bot API 10.1) как основной формат вывода;
+        # если клиент его не поддерживает — отправляем обычный HTML.
+        try:
+            from aiogram.types import InputRichMessage
+
+            await message.bot.send_rich_message(
+                chat_id=message.chat.id,
+                rich_message=InputRichMessage(html=rich_html),
+            )
+        except Exception:
+            logger.warning("send_rich_message не удался, откат на HTML", exc_info=True)
+            await message.answer(formatted, parse_mode="HTML")
 
     except Exception as e:
         logger.exception("Ошибка при анализе @%s", username)
-        error_text = f"❌ Ошибка при анализе @{html.escape(username)}:\n{html.escape(str(e))}"
+        error_text = (
+            f"❌ Ошибка при анализе @{html.escape(username)}:\n{html.escape(str(e))}"
+        )
         try:
             await progress_msg.edit_text(error_text)
         except Exception:
             await message.answer(error_text)
 
 
+async def start_analyze(message: types.Message, state: FSMContext) -> None:
+    """Точка входа в /analyze без аргументов — из reply-кнопки меню."""
+    await state.clear()
+    await message.answer("Введите ID канала:", reply_markup=close_keyboard())
+    await state.set_state(AnalyzeStates.waiting_input)
+
+
 @router.message(Command("analyze"))
 async def cmd_analyze(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
     args = message.text.split(maxsplit=1)
     if len(args) < 2 or not args[1].strip():
         await message.answer("Введите ID канала:", reply_markup=close_keyboard())

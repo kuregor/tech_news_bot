@@ -1,26 +1,26 @@
 import asyncio
 import html as html_mod
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from collections import Counter, defaultdict
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
-from collections import Counter, defaultdict
-
+from core import topics as taxonomy
 from core.ai import ai_client
 from core.embeddings import embedding_service
+from core.formatting import _fmt_num, _plural, _truncate
+from core.metrics import _calc_er, _channel_averages
+from core.metrics import _viral_score as _calc_score
 from core.parser import telegram_parser
+from db.models import DigestStatus, Post
 from db.repository import (
     batch_upsert_posts,
-    get_list_channels,
     get_posts_by_channels,
-    get_topics_by_channel,
     save_digest,
-    update_digest_status,
 )
-from db.models import DigestStatus, Post
 
 logger = logging.getLogger(__name__)
 
@@ -30,42 +30,11 @@ TOP_N_MAP = {1: 5, 7: 10, 14: 15}
 # Минимум постов с канала в пул кандидатов — чтобы ни один канал не монополизировал топ
 POSTS_PER_CHANNEL = 2
 
-PERIOD_LABELS = {1: "24 часа", 7: "неделю", 14: "две недели"}
+PERIOD_LABELS = {1: "24 часа", 7: "за неделю", 14: "за две недели"}
 
-
-def _channel_averages(posts: list[Post]) -> dict[int, tuple[float, float, float]]:
-    """Средние views / reactions / forwards по каждому каналу за период."""
-    by_channel: dict[int, list[Post]] = defaultdict(list)
-    for p in posts:
-        by_channel[p.channel_id].append(p)
-    stats: dict[int, tuple[float, float, float]] = {}
-    for ch_id, ps in by_channel.items():
-        n = len(ps)
-        if not n:
-            stats[ch_id] = (1.0, 1.0, 1.0)
-            continue
-        avg_v = sum(p.views or 0 for p in ps) / n
-        avg_r = sum(p.reactions or 0 for p in ps) / n
-        avg_f = sum(p.forwards or 0 for p in ps) / n
-        stats[ch_id] = (avg_v, avg_r, avg_f)
-    return stats
-
-
-def _calc_score(post: Post, ch_stats: dict[int, tuple[float, float, float]]) -> float:
-    """Нормализованный рейтинг поста относительно среднего по его каналу.
-
-    score = (views/avg_v)*0.4 + (reactions/avg_r)*0.4 + (forwards/avg_f)*0.2.
-    Защита от деления на ноль: если avg = 0, используется 1.
-    """
-    avg_v, avg_r, avg_f = ch_stats.get(post.channel_id, (1.0, 1.0, 1.0))
-    avg_v = avg_v if avg_v > 0 else 1.0
-    avg_r = avg_r if avg_r > 0 else 1.0
-    avg_f = avg_f if avg_f > 0 else 1.0
-    return (
-        (post.views or 0) / avg_v * 0.4
-        + (post.reactions or 0) / avg_r * 0.4
-        + (post.forwards or 0) / avg_f * 0.2
-    )
+# Порог косинусной близости для семантического фильтра по ключевым словам.
+# Выше → строже (меньше «похожих» постов), ниже → шире.
+KEYWORD_SIMILARITY_THRESHOLD = 0.65
 
 
 async def _ensure_post_embeddings(posts: list[Post]) -> None:
@@ -78,7 +47,10 @@ async def _ensure_post_embeddings(posts: list[Post]) -> None:
         return
     try:
         embeddings = await embedding_service.get_embeddings_batch(texts)
-        metadatas = [{"post_id": pid, "channel_id": posts[i].channel_id} for i, pid in enumerate(ids)]
+        metadatas = [
+            {"post_id": pid, "channel_id": posts[i].channel_id}
+            for i, pid in enumerate(ids)
+        ]
         embedding_service.upsert_post_embeddings_batch(ids, embeddings, metadatas)
     except Exception as e:
         logger.warning("Не удалось построить эмбеддинги постов: %s", e)
@@ -97,15 +69,16 @@ async def _filter_by_keywords(
     if not keywords:
         return posts
 
-    post_ids_set = {p.id for p in posts}
-
     try:
         # Умная фильтрация через эмбеддинги
         matched_ids = set()
         for kw in keywords:
             kw_embedding = await embedding_service.get_embedding(kw)
             found = embedding_service.filter_by_keyword_embedding(
-                kw_embedding, channel_ids=channel_ids, threshold=0.5, top_k=200
+                kw_embedding,
+                channel_ids=channel_ids,
+                threshold=KEYWORD_SIMILARITY_THRESHOLD,
+                top_k=200,
             )
             matched_ids.update(found)
         # Пересечение с нашими постами
@@ -114,12 +87,15 @@ async def _filter_by_keywords(
             logger.info("Умная фильтрация: %d → %d постов", len(posts), len(filtered))
             return filtered
     except Exception as e:
-        logger.warning("Умная фильтрация не удалась, fallback на текстовый поиск: %s", e)
+        logger.warning(
+            "Умная фильтрация не удалась, fallback на текстовый поиск: %s", e
+        )
 
     # Fallback: текстовый поиск
     keywords_lower = [kw.lower() for kw in keywords]
     filtered = [
-        p for p in posts
+        p
+        for p in posts
         if p.text and any(kw in p.text.lower() for kw in keywords_lower)
     ]
     logger.info("Текстовая фильтрация: %d → %d постов", len(posts), len(filtered))
@@ -175,34 +151,44 @@ def _rank_and_limit(
     return pool[:top_n]
 
 
-def _calc_er(post: Post) -> str:
-    """ER поста: (reactions + comments) / views * 100."""
-    if not post.views:
-        return "0"
-    return f"{(post.reactions + post.comments) / post.views * 100:.1f}"
+def _preselect(
+    posts: list[Post],
+    cap: int,
+    ch_stats: dict[int, tuple[float, float, float]],
+) -> list[Post]:
+    """Грубый предотбор кандидатов по engagement-score до классификации.
+
+    Берём топ-`cap` постов по нормализованному score, чтобы не гонять LLM
+    по сотням постов. Запас (cap = 4 × top_n) — чтобы после отсева other
+    осталось ≥ top_n.
+    """
+    if len(posts) <= cap:
+        return posts
+    return sorted(posts, key=lambda p: _calc_score(p, ch_stats), reverse=True)[:cap]
 
 
 def _group_by_topic(
     top_posts: list[Post],
-    classifications: list[dict],
+    topic_by_id: dict[int, str],
     ch_stats: dict[int, tuple[float, float, float]],
 ) -> list[tuple[str, str, list[Post]]]:
-    """Группировка постов по темам.
+    """Группировка постов по slug-темам из закрытого набора.
 
     Возвращает [(emoji, label, [posts]), ...] отсортированные по суммарному score.
+    Пустые темы не появляются (группа создаётся только при наличии постов),
+    посты other пропускаются (страховка — они уже отсеяны выше).
     """
-    topic_map = {}
-    for item in classifications:
-        topic_map[item["id"]] = (item.get("topic", "Разное"), item.get("emoji", "📌"))
-
-    groups: dict[str, tuple[str, list[Post]]] = {}
+    groups: dict[str, list[Post]] = defaultdict(list)
     for post in top_posts:
-        topic, emoji = topic_map.get(post.id, ("Разное", "📌"))
-        if topic not in groups:
-            groups[topic] = (emoji, [])
-        groups[topic][1].append(post)
+        slug = topic_by_id.get(post.id, taxonomy.OTHER)
+        if slug == taxonomy.OTHER:
+            continue
+        groups[slug].append(post)
 
-    result = [(emoji, label, posts) for label, (emoji, posts) in groups.items()]
+    result = [
+        (taxonomy.emoji_for(slug), taxonomy.label_for(slug), posts)
+        for slug, posts in groups.items()
+    ]
     result.sort(key=lambda g: sum(_calc_score(p, ch_stats) for p in g[2]), reverse=True)
     return result
 
@@ -251,8 +237,8 @@ async def run_digest_pipeline(
         if progress_callback:
             await progress_callback(text)
 
-    period_from = datetime.now(timezone.utc) - timedelta(days=period_days)
-    period_to = datetime.now(timezone.utc)
+    period_from = datetime.now(UTC) - timedelta(days=period_days)
+    period_to = datetime.now(UTC)
 
     # 0. Подтягиваем свежие посты из Telegram для каждого канала списка,
     #    чтобы дайджест работал даже на каналах без /analyze.
@@ -294,35 +280,54 @@ async def run_digest_pipeline(
     await _progress("🔎 Убираем дубликаты... (5/8)")
     posts = _deduplicate(posts)
 
-    # 5. Ранжирование
-    await _progress("📊 Ранжируем... (6/8)")
-    top_posts = _rank_and_limit(posts, period_days, ch_stats)
-
-    # 6. AI-суммаризация + классификация по темам (параллельно)
-    await _progress("✍️ Генерируем резюме и классифицируем... (7/8)")
+    # 5. Предотбор кандидатов и классификация по закрытому набору тем.
+    #    Классифицируем расширенный пул (×4 от top_n), отсекаем other, и только
+    #    потом финально ранжируем — чтобы не суммаризировать посты вне тем.
+    await _progress("📊 Ранжируем и классифицируем... (6/8)")
+    top_n = TOP_N_MAP.get(period_days, 10)
+    candidates = _preselect(posts, top_n * 4, ch_stats)
     posts_for_classify = [
-        {"id": p.id, "text": (p.text or "")[:200]} for p in top_posts
+        {"id": p.id, "text": (p.text or "")[:200]} for p in candidates
     ]
-    summaries, classifications = await asyncio.gather(
-        _summarize_posts(top_posts),
-        ai_client.classify_posts_by_topic(posts_for_classify),
-    )
+    classifications = await ai_client.classify_posts_by_topic(posts_for_classify)
+    topic_by_id = {c["id"]: c["topic"] for c in classifications if isinstance(c, dict)}
 
-    # 6.5. Группировка по темам
+    # Отсекаем посты вне тем (other / без классификации)
+    on_topic = [
+        p for p in candidates if topic_by_id.get(p.id, taxonomy.OTHER) != taxonomy.OTHER
+    ]
+
+    # 6. Финальное ранжирование выживших → top-N
+    top_posts = _rank_and_limit(on_topic, period_days, ch_stats)
+    if not top_posts:
+        return {
+            "empty": True,
+            "channel_names": channel_names,
+            "period_days": period_days,
+            "keywords": keywords,
+        }
+
+    # 7. Суммаризация финальных постов
+    await _progress("✍️ Генерируем резюме... (7/8)")
+    summaries = await _summarize_posts(top_posts)
+
+    # 7.5. Группировка по темам
     await _progress("📂 Группируем по темам... (8/8)")
-    grouped_posts = _group_by_topic(top_posts, classifications, ch_stats)
+    grouped_posts = _group_by_topic(top_posts, topic_by_id, ch_stats)
 
     # 7. Собираем данные для сохранения
     posts_data = []
     for i, post in enumerate(top_posts):
-        posts_data.append({
-            "post_id": post.id,
-            "rank": i + 1,
-            "summary": summaries[i] if i < len(summaries) else "",
-        })
+        posts_data.append(
+            {
+                "post_id": post.id,
+                "rank": i + 1,
+                "summary": summaries[i] if i < len(summaries) else "",
+            }
+        )
 
     # 8. Сохраняем дайджест
-    digest = await save_digest(
+    await save_digest(
         session,
         user_id=user_id,
         channel_list_id=channel_list_id,
@@ -342,18 +347,8 @@ async def run_digest_pipeline(
     top_channel_id = channel_counter.most_common(1)[0][0] if channel_counter else None
     top_channel_name = channel_map.get(top_channel_id, "?") if top_channel_id else "?"
 
-    # Главная тема — из channel_topics наиболее частая
-    main_topic = ""
-    try:
-        topic_counter = Counter()
-        for ch_id in channel_ids:
-            topics = await get_topics_by_channel(session, ch_id, min_percentage=settings.TOPIC_THRESHOLD)
-            for t in topics:
-                topic_counter[t.label] += 1
-        if topic_counter:
-            main_topic = topic_counter.most_common(1)[0][0]
-    except Exception:
-        pass
+    # Главная тема — самая весомая группа самого дайджеста
+    main_topic = grouped_posts[0][1] if grouped_posts else ""
 
     return {
         "empty": False,
@@ -373,25 +368,6 @@ async def run_digest_pipeline(
     }
 
 
-def _fmt_num(n: int | float) -> str:
-    """Форматировать число с пробелом-разделителем."""
-    n = round(n)
-    if n < 10_000:
-        return str(n)
-    return f"{n:,}".replace(",", " ")
-
-
-def _truncate_title(text: str, max_len: int = 80) -> str:
-    """Обрезать текст поста до заголовка, по границе слова."""
-    line = (text or "").replace("\n", " ").strip()[:max_len]
-    if len(text or "") > max_len:
-        last_space = line.rfind(" ")
-        if last_space > 0:
-            line = line[:last_space]
-        line += "..."
-    return line
-
-
 def format_digest(data: dict) -> str:
     """Назначение: форматировать результат /digest в текст для Telegram (HTML).
 
@@ -402,11 +378,16 @@ def format_digest(data: dict) -> str:
         str: готовое HTML-сообщение.
     """
     if data.get("empty"):
-        period_label = PERIOD_LABELS.get(data["period_days"], f"{data['period_days']} дн.")
+        period_label = PERIOD_LABELS.get(
+            data["period_days"], f"{data['period_days']} дн."
+        )
         channels = " · ".join(f"@{n}" for n in data["channel_names"])
+        keywords = data.get("keywords")
+        filter_line = f"🔑 Фильтр: {' · '.join(keywords)}\n" if keywords else ""
         return (
             f"📰 Дайджест · {period_label}\n"
-            f"📋 {channels}\n\n"
+            f"📋 {channels}\n"
+            f"{filter_line}\n"
             "Постов за этот период не найдено."
         )
 
@@ -433,35 +414,36 @@ def format_digest(data: dict) -> str:
 
     rank = 0
     for emoji, label, posts in grouped_posts:
-        n_word = _plural_materials(len(posts))
         lines.append("")
-        lines.append(f"{emoji} <b>{html_mod.escape(label)}</b> ({len(posts)} {n_word})")
+        lines.append(f"{emoji} <b>{html_mod.escape(label)}</b>")
         lines.append("")
 
         for post in posts:
             rank += 1
-            title = html_mod.escape(_truncate_title(post.text))
+            title = html_mod.escape(_truncate(post.text, 80))
             ch_username = channel_map.get(post.channel_id, "?")
             url = f"https://t.me/{ch_username}/{post.tg_id}"
             date_str = f"{post.date.day:02d}.{post.date.month:02d}"
-            er = _calc_er(post)
+            er = f"{_calc_er(post.reactions or 0, post.comments or 0, post.views or 0):.1f}"
             summary = summary_map.get(post.id, "")
 
-            lines.append(
-                f'{rank}️⃣ <a href="{url}">«{title}»</a>'
-            )
-            lines.append(
-                f"📣 @{ch_username} · {date_str} · ER <b>{er}%</b> · 👁 {_fmt_num(post.views)}"
-            )
+            lines.append(f'{rank}️⃣ <a href="{url}">«{title}»</a>')
+            lines.append(f"📣 @{ch_username}")
             if summary:
                 lines.append(f"▸ {html_mod.escape(summary)}")
+            lines.append(
+                f"🗓 {date_str} · 👁 {_fmt_num(post.views)} · "
+                f"❤️ {_fmt_num(post.reactions or 0)} · 💬 {_fmt_num(post.comments or 0)} · "
+                f"ER <b>{er}%</b>"
+            )
             lines.append("")
 
         lines.append("━━━━━━━━━━━━━━━━━━━━")
 
     lines.append(
-        f"📊 <b>{data['top_n']}</b> материалов · <b>{data['topics_count']}</b> тем · "
-        f"из {data['total_found']} найденных"
+        f"📊 <b>{data['top_n']}</b> {_plural(data['top_n'], 'материал', 'материала', 'материалов')} · "
+        f"<b>{data['topics_count']}</b> {_plural(data['topics_count'], 'тема', 'темы', 'тем')} · "
+        f"из {data['total_found']} постов"
     )
     lines.append(f"🏆 Топ-канал: <b>@{data['top_channel']}</b>")
     if data.get("main_topic"):
@@ -470,20 +452,84 @@ def format_digest(data: dict) -> str:
     return "\n".join(lines)
 
 
-def _plural_materials(n: int) -> str:
-    """Склонение слова 'материал'."""
-    if 11 <= n % 100 <= 19:
-        return "материалов"
-    last = n % 10
-    if last == 1:
-        return "материал"
-    if 2 <= last <= 4:
-        return "материала"
-    return "материалов"
+def format_digest_rich(data: dict) -> str:
+    """Назначение: форматировать /digest в rich-HTML (структурная страница).
 
+    Запасной вариант — обычный format_digest.
+    """
+    period_label = PERIOD_LABELS.get(data["period_days"], f"{data['period_days']} дн.")
+    channels = " · ".join(f"@{html_mod.escape(n)}" for n in data["channel_names"])
 
-class DigestService:
-    """Сервис-фасад команды /digest: пайплайн дайджеста и форматирование."""
+    if data.get("empty"):
+        keywords = data.get("keywords")
+        filter_line = (
+            f"<p>🔑 Фильтр: {' · '.join(html_mod.escape(k) for k in keywords)}</p>"
+            if keywords
+            else ""
+        )
+        return (
+            f"<h2>📰 Дайджест · {period_label}</h2>"
+            f"<p>📋 {channels}</p>"
+            f"{filter_line}"
+            "<p>Постов за этот период не найдено.</p>"
+        )
 
-    run_digest_pipeline = staticmethod(run_digest_pipeline)
-    format_digest = staticmethod(format_digest)
+    parts = [
+        f"<h2>📰 Дайджест · {data['period_label']}</h2>",
+        f"<p>📋 {channels}</p>",
+    ]
+    keywords = data.get("keywords")
+    if keywords:
+        kw = " · ".join(html_mod.escape(k) for k in keywords)
+        parts.append(f"<p>🔑 Фильтр: {kw}</p>")
+    parts.append("<hr/>")
+
+    channel_map = data["channel_map"]
+    summary_map = {}
+    for i, post in enumerate(data["top_posts"]):
+        summary_map[post.id] = (
+            data["summaries"][i] if i < len(data["summaries"]) else ""
+        )
+
+    rank = 0
+    for emoji, label, posts in data["grouped_posts"]:
+        parts.append(f"<h3>{emoji} {html_mod.escape(label)}</h3>")
+        # Сквозная нумерация: список каждой темы продолжает счёт предыдущей.
+        parts.append(f'<ol start="{rank + 1}">')
+        for post in posts:
+            rank += 1
+            title = html_mod.escape(_truncate(post.text, 80))
+            ch_username = channel_map.get(post.channel_id, "?")
+            url = f"https://t.me/{html_mod.escape(ch_username)}/{post.tg_id}"
+            date_str = f"{post.date.day:02d}.{post.date.month:02d}"
+            er = f"{_calc_er(post.reactions or 0, post.comments or 0, post.views or 0):.1f}"
+            summary = summary_map.get(post.id, "")
+            metrics = (
+                f"🗓 {date_str} · 👁 {_fmt_num(post.views)} · "
+                f"❤️ {_fmt_num(post.reactions or 0)} · 💬 {_fmt_num(post.comments or 0)} · "
+                f"ER <b>{er}%</b>"
+            )
+            item = (
+                f'<li><a href="{url}">«{title}»</a>'
+                f"<br>📣 @{html_mod.escape(ch_username)}"
+            )
+            if summary:
+                item += f"<blockquote>{html_mod.escape(summary)}</blockquote>{metrics}"
+            else:
+                item += f"<br>{metrics}"
+            item += "</li>"
+            parts.append(item)
+        parts.append("</ol>")
+
+    parts.append("<hr/>")
+    footer = (
+        f"📊 <b>{data['top_n']}</b> {_plural(data['top_n'], 'материал', 'материала', 'материалов')} · "
+        f"<b>{data['topics_count']}</b> {_plural(data['topics_count'], 'тема', 'темы', 'тем')} · "
+        f"из {data['total_found']} постов"
+        f"<br>🏆 Топ-канал: <b>@{html_mod.escape(data['top_channel'])}</b>"
+    )
+    if data.get("main_topic"):
+        footer += f"<br>🔥 Главная тема: {html_mod.escape(data['main_topic'])}"
+    parts.append(f"<p>{footer}</p>")
+
+    return "".join(parts)

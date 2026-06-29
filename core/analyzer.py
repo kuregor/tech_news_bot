@@ -1,15 +1,16 @@
 import asyncio
 import html as html_mod
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-EMBEDDING_TTL_DAYS = 30
-
 from core.ai import ai_client
 from core.embeddings import embedding_service
+from core.formatting import _decline_posts, _fmt_num, _truncate
+from core.metrics import _calc_er
 from core.parser import telegram_parser
 from db.repository import (
     batch_insert_topics,
@@ -18,12 +19,15 @@ from db.repository import (
     get_cached_analysis,
     get_channel_by_username,
     get_posts_by_channel,
+    get_topics_by_channel,
     save_analysis,
     update_channel_embedding_timestamp,
     upsert_channel,
 )
 
 logger = logging.getLogger(__name__)
+
+EMBEDDING_TTL_DAYS = 30
 
 
 async def run_analyze_pipeline(
@@ -53,11 +57,9 @@ async def run_analyze_pipeline(
         cached = await get_cached_analysis(session, channel.id)
         if cached:
             # Проверяем свежесть вектора канала
-            stale = (
-                channel.embedding_updated_at is None
-                or datetime.now(timezone.utc) - channel.embedding_updated_at
-                > timedelta(days=EMBEDDING_TTL_DAYS)
-            )
+            stale = channel.embedding_updated_at is None or datetime.now(
+                UTC
+            ) - channel.embedding_updated_at > timedelta(days=EMBEDDING_TTL_DAYS)
             if stale:
                 await _progress("🔢 Обновляем вектор канала...")
                 channel_info = await telegram_parser.parse_channel_info(username)
@@ -67,20 +69,26 @@ async def run_analyze_pipeline(
                 top_posts_texts = [p.text for p in recent_posts if p.text]
                 embed_text = (
                     f"{channel_info['title']}\n"
-                    f"{channel_info['description']}\n"
-                    + "\n".join(top_posts_texts[:20])
+                    f"{channel_info['description']}\n" + "\n".join(top_posts_texts[:20])
                 )
                 try:
-                    channel_embedding = await embedding_service.get_embedding(embed_text[:8000])
+                    channel_embedding = await embedding_service.get_embedding(
+                        embed_text[:8000]
+                    )
                     embedding_service.upsert_channel_embedding(
                         channel.id,
                         channel_embedding,
-                        metadata={"username": username, "title": channel_info["title"] or ""},
+                        metadata={
+                            "username": username,
+                            "title": channel_info["title"] or "",
+                        },
                     )
                     await update_channel_embedding_timestamp(session, channel.id)
                     logger.info("Вектор канала @%s обновлён (истёк TTL)", username)
                 except Exception as e:
-                    logger.warning("Не удалось обновить вектор канала @%s: %s", username, e)
+                    logger.warning(
+                        "Не удалось обновить вектор канала @%s: %s", username, e
+                    )
 
             logger.info("Возвращаем кэшированный анализ для @%s", username)
             topics = await _get_channel_topics_aggregated(session, channel.id)
@@ -98,7 +106,9 @@ async def run_analyze_pipeline(
                 }
                 for p in cached_posts
             ]
-            return _build_result(channel, cached, topics, top_posts=top_posts_data, from_cache=True)
+            return _build_result(
+                channel, cached, topics, top_posts=top_posts_data, from_cache=True
+            )
 
     # 2. Парсинг канала через Telethon
     await _progress("⏳ Получаем посты... (1/5)")
@@ -141,8 +151,7 @@ async def run_analyze_pipeline(
         f"{channel_info['title']}\n"
         f"{channel_info['description']}\n"
         f"{' '.join(hashtags)}\n"
-        f"{' '.join(trending_keywords)}\n"
-        + "\n".join(top_posts_texts[:20])
+        f"{' '.join(trending_keywords)}\n" + "\n".join(top_posts_texts[:20])
     )
     try:
         channel_embedding = await embedding_service.get_embedding(embed_text[:8000])
@@ -159,8 +168,12 @@ async def run_analyze_pipeline(
     await _progress("📊 Считаем метрики... (5/5)")
     posts_count = len(all_posts)
     avg_views = sum(p.views for p in all_posts) / posts_count if posts_count else 0
-    avg_reactions = sum(p.reactions for p in all_posts) / posts_count if posts_count else 0
-    avg_comments = sum(p.comments for p in all_posts) / posts_count if posts_count else 0
+    avg_reactions = (
+        sum(p.reactions for p in all_posts) / posts_count if posts_count else 0
+    )
+    avg_comments = (
+        sum(p.comments for p in all_posts) / posts_count if posts_count else 0
+    )
 
     # 7. Сохраняем анализ в БД
     analysis = await save_analysis(
@@ -206,7 +219,8 @@ async def run_analyze_pipeline(
     ]
 
     return _build_result(
-        channel, analysis,
+        channel,
+        analysis,
         topics_info={
             "top_topics": top_topics,
             "trending_keywords": trending_keywords,
@@ -217,9 +231,10 @@ async def run_analyze_pipeline(
     )
 
 
-async def _get_channel_topics_aggregated(session: AsyncSession, channel_id: int) -> dict:
+async def _get_channel_topics_aggregated(
+    session: AsyncSession, channel_id: int
+) -> dict:
     """Собрать агрегированные темы канала для кэшированного результата."""
-    from db.repository import get_topics_by_channel
     topics = await get_topics_by_channel(session, channel_id, min_percentage=0.3)
     # Группируем по label, берём max percentage
     label_map: dict[str, float] = {}
@@ -234,7 +249,9 @@ async def _get_channel_topics_aggregated(session: AsyncSession, channel_id: int)
 
 
 def _build_result(
-    channel, analysis, topics_info: dict,
+    channel,
+    analysis,
+    topics_info: dict,
     top_posts: list[dict] | None = None,
     from_cache: bool = False,
 ) -> dict:
@@ -256,35 +273,6 @@ def _build_result(
         "top_posts": top_posts or [],
         "from_cache": from_cache,
     }
-
-
-def _fmt_num(n: int | float) -> str:
-    """Форматировать число с пробелом-разделителем (112 731)."""
-    n = round(n)
-    if n < 10_000:
-        return str(n)
-    return f"{n:,}".replace(",", " ")
-
-
-def _calc_er(reactions: int | float, comments: int | float, views: int | float) -> float:
-    """ER = (реакции + комментарии) / просмотры × 100."""
-    if not views:
-        return 0.0
-    return round(((reactions or 0) + (comments or 0)) / views * 100, 1)
-
-
-def _truncate_preview(text: str, max_len: int = 60) -> str:
-    """Обрезать текст до max_len символов по целому слову, добавить «...»."""
-    text = text.replace("\n", " ").strip()
-    if len(text) <= max_len:
-        return text
-    truncated = text[:max_len]
-    # Обрезаем по последнему пробелу
-    last_space = truncated.rfind(" ")
-    if last_space > 0:
-        truncated = truncated[:last_space]
-    return truncated + "..."
-
 
 
 def _fmt_date(dt) -> str:
@@ -313,7 +301,7 @@ def format_analyze_result(data: dict) -> str:
     tagline = data.get("tagline", "")
 
     lines = [
-        f"📊 <b>@{username}</b> · {posts_count} постов",
+        f"📊 <b>Анализ канала @{username}</b> · {_decline_posts(posts_count)}",
     ]
     if tagline:
         lines.append(f"<i>«{html_mod.escape(tagline)}»</i>")
@@ -347,7 +335,7 @@ def format_analyze_result(data: dict) -> str:
         lines.append("")
         for i, post in enumerate(top_posts[:3]):
             medal = medals[i]
-            preview = _truncate_preview(post["text"])
+            preview = _truncate(post["text"], 80)
             url = post["url"]
             views = post["views"]
             reactions = post["reactions"]
@@ -356,8 +344,8 @@ def format_analyze_result(data: dict) -> str:
             date_str = _fmt_date(post["date"])
             lines.append(f'{medal} <a href="{url}">{html_mod.escape(preview)}</a>')
             lines.append(
-                f"👁 {_fmt_num(views)} · ❤️ {_fmt_num(reactions)} · "
-                f"💬 {_fmt_num(comments)} · ER <b>{post_er}%</b> · 📅 {date_str}"
+                f"🗓 {date_str} · 👁 {_fmt_num(views)} · ❤️ {_fmt_num(reactions)} · "
+                f"💬 {_fmt_num(comments)} · ER <b>{post_er}%</b>"
             )
             lines.append("")
 
@@ -371,8 +359,76 @@ def format_analyze_result(data: dict) -> str:
     return "\n".join(lines)
 
 
-class AnalyzerService:
-    """Сервис-фасад команды /analyze: пайплайн анализа канала и форматирование."""
+def format_analyze_rich(data: dict) -> str:
+    """Назначение: форматировать /analyze в rich-HTML (структурная страница).
 
-    run_analyze_pipeline = staticmethod(run_analyze_pipeline)
-    format_analyze_result = staticmethod(format_analyze_result)
+    Блочные теги rich-сообщений рендерятся Telegram как страница; простой
+    format_analyze_result остаётся fallback-ом для старых клиентов / ошибки API.
+    """
+    username = data["username"]
+    posts_count = data["posts_count"]
+    about = data.get("about", "")
+    style = data.get("style", "")
+    avg_views = data.get("avg_views", 0)
+    avg_reactions = data.get("avg_reactions", 0)
+    avg_comments = data.get("avg_comments", 0)
+    er = _calc_er(avg_reactions, avg_comments, avg_views)
+    tagline = data.get("tagline", "")
+
+    parts = [
+        f"<h2>📊 Анализ канала @{html_mod.escape(username)}</h2>",
+        f"<p>{_decline_posts(posts_count)}</p>",
+    ]
+    if tagline:
+        parts.append(f"<p><i>«{html_mod.escape(tagline)}»</i></p>")
+    if about:
+        parts.append(f"<p>📝 {html_mod.escape(about)}</p>")
+    if style:
+        parts.append(f"<p>✍️ {html_mod.escape(style)}</p>")
+    parts.append("<hr/>")
+    parts.append(
+        f"<p>👁 {_fmt_num(avg_views)} охват · ❤️ {_fmt_num(avg_reactions)} · "
+        f"💬 {_fmt_num(avg_comments)} · ER <b>{er}%</b></p>"
+    )
+
+    top_topics = data.get("top_topics", [])
+    if top_topics:
+        parts.append("<h3>🏷 Топ тем</h3>")
+        parts.append("<table>")
+        parts.append(
+            '<tr><th align="left">№</th><th align="left">Тема</th>'
+            '<th align="left">Доля</th></tr>'
+        )
+        for i, topic in enumerate(top_topics, 1):
+            pct = topic.get("percentage", 0)
+            pct_display = round(pct * 100) if pct <= 1.0 else round(pct)
+            parts.append(
+                f'<tr><td align="left">{i}</td>'
+                f'<td align="left">{html_mod.escape(topic["label"])}</td>'
+                f'<td align="left">{pct_display}%</td></tr>'
+            )
+        parts.append("</table>")
+
+    top_posts = data.get("top_posts", [])
+    if top_posts:
+        medals = ["🥇", "🥈", "🥉"]
+        parts.append("<h3>🏆 Топ посты</h3>")
+        parts.append("<ul>")
+        for i, post in enumerate(top_posts[:3]):
+            preview = html_mod.escape(_truncate(post["text"], 80))
+            post_er = _calc_er(post["reactions"], post["comments"], post["views"])
+            parts.append(
+                f'<li>{medals[i]} <a href="{post["url"]}">{preview}</a>'
+                f"<br>🗓 {_fmt_date(post['date'])} · 👁 {_fmt_num(post['views'])} · "
+                f"❤️ {_fmt_num(post['reactions'])} · 💬 {_fmt_num(post['comments'])} · "
+                f"ER <b>{post_er}%</b></li>"
+            )
+        parts.append("</ul>")
+
+    hashtags = data.get("hashtags", [])
+    if hashtags:
+        parts.append("<hr/>")
+        tags_str = " · ".join(html_mod.escape(h) for h in hashtags)
+        parts.append(f"<p>🔑 {tags_str}</p>")
+
+    return "".join(parts)

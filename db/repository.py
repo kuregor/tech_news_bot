@@ -1,21 +1,27 @@
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from db.models import (
-    Analysis, Channel, ChannelList, ChannelListItem,
-    ChannelTopic, Digest, DigestStatus, Post,
+    Analysis,
+    Channel,
+    ChannelList,
+    ChannelListItem,
+    ChannelTopic,
+    Digest,
+    DigestStatus,
+    Post,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# ─── Channels ───────────────────────────────────────────
+# Channels
+
 
 async def upsert_channel(
     session: AsyncSession,
@@ -25,45 +31,53 @@ async def upsert_channel(
     subscribers_count: int = 0,
 ) -> Channel:
     """Создать или обновить канал по username."""
-    stmt = pg_insert(Channel).values(
-        username=username,
-        title=title,
-        description=description,
-        subscribers_count=subscribers_count,
-        parsed_at=datetime.now(timezone.utc),
-    ).on_conflict_do_update(
-        index_elements=["username"],
-        set_={
-            "title": title,
-            "description": description,
-            "subscribers_count": subscribers_count,
-            "parsed_at": datetime.now(timezone.utc),
-        },
-    ).returning(Channel)
+    stmt = (
+        pg_insert(Channel)
+        .values(
+            username=username,
+            title=title,
+            description=description,
+            subscribers_count=subscribers_count,
+            parsed_at=datetime.now(UTC),
+        )
+        .on_conflict_do_update(
+            index_elements=["username"],
+            set_={
+                "title": title,
+                "description": description,
+                "subscribers_count": subscribers_count,
+                "parsed_at": datetime.now(UTC),
+            },
+        )
+        .returning(Channel)
+    )
     result = await session.execute(stmt)
     await session.commit()
     return result.scalar_one()
 
 
-async def get_channel_by_username(session: AsyncSession, username: str) -> Channel | None:
+async def get_channel_by_username(
+    session: AsyncSession, username: str
+) -> Channel | None:
     """Найти канал по username."""
-    result = await session.execute(
-        select(Channel).where(Channel.username == username)
-    )
+    result = await session.execute(select(Channel).where(Channel.username == username))
     return result.scalar_one_or_none()
 
 
-async def update_channel_embedding_timestamp(session: AsyncSession, channel_id: int) -> None:
+async def update_channel_embedding_timestamp(
+    session: AsyncSession, channel_id: int
+) -> None:
     """Обновить время последнего построения вектора канала."""
     await session.execute(
         update(Channel)
         .where(Channel.id == channel_id)
-        .values(embedding_updated_at=datetime.now(timezone.utc))
+        .values(embedding_updated_at=datetime.now(UTC))
     )
     await session.commit()
 
 
-# ─── Posts ───────────────────────────────────────────────
+# Posts
+
 
 async def batch_upsert_posts(
     session: AsyncSession,
@@ -74,21 +88,26 @@ async def batch_upsert_posts(
     if not posts_data:
         return []
 
-    stmt = pg_insert(Post).values([
-        {
-            "channel_id": channel_id,
-            "tg_id": p["tg_id"],
-            "text": p["text"],
-            "views": p.get("views", 0),
-            "reactions": p.get("reactions", 0),
-            "comments": p.get("comments", 0),
-            "forwards": p.get("forwards", 0),
-            "date": p["date"],
-        }
-        for p in posts_data
-    ]).on_conflict_do_nothing(
-        index_elements=["channel_id", "tg_id"]
-    ).returning(Post)
+    stmt = (
+        pg_insert(Post)
+        .values(
+            [
+                {
+                    "channel_id": channel_id,
+                    "tg_id": p["tg_id"],
+                    "text": p["text"],
+                    "views": p.get("views", 0),
+                    "reactions": p.get("reactions", 0),
+                    "comments": p.get("comments", 0),
+                    "forwards": p.get("forwards", 0),
+                    "date": p["date"],
+                }
+                for p in posts_data
+            ]
+        )
+        .on_conflict_do_nothing(index_elements=["channel_id", "tg_id"])
+        .returning(Post)
+    )
     result = await session.execute(stmt)
     await session.commit()
     return list(result.scalars().all())
@@ -130,7 +149,8 @@ async def get_posts_by_channels(
     return list(result.scalars().all())
 
 
-# ─── Channel Topics ─────────────────────────────────────
+# Channel Topics
+
 
 async def batch_insert_topics(
     session: AsyncSession,
@@ -139,14 +159,16 @@ async def batch_insert_topics(
     """Batch insert тем для постов."""
     if not topics_data:
         return
-    session.add_all([
-        ChannelTopic(
-            post_id=t["post_id"],
-            label=t["label"],
-            percentage=t["percentage"],
-        )
-        for t in topics_data
-    ])
+    session.add_all(
+        [
+            ChannelTopic(
+                post_id=t["post_id"],
+                label=t["label"],
+                percentage=t["percentage"],
+            )
+            for t in topics_data
+        ]
+    )
     await session.commit()
 
 
@@ -179,44 +201,18 @@ async def get_topics_by_channel(
     return list(result.scalars().all())
 
 
-async def get_topic_counts_by_channels(
-    session: AsyncSession,
-    channel_ids: list[int],
-    period_from: datetime,
-    period_to: datetime,
-    min_percentage: float = 0.3,
-) -> list[dict]:
-    """Подсчёт упоминаний тем за период (для /trends)."""
-    stmt = (
-        select(
-            ChannelTopic.label,
-            Post.date,
-            func.count().label("cnt"),
-            func.avg(Post.views).label("avg_views"),
-        )
-        .join(Post, ChannelTopic.post_id == Post.id)
-        .where(
-            Post.channel_id.in_(channel_ids),
-            Post.date >= period_from,
-            Post.date <= period_to,
-            ChannelTopic.percentage >= min_percentage,
-        )
-        .group_by(ChannelTopic.label, Post.date)
-    )
-    result = await session.execute(stmt)
-    return [dict(row._mapping) for row in result.all()]
+# Analyses
 
-
-# ─── Analyses ───────────────────────────────────────────
 
 async def get_cached_analysis(
     session: AsyncSession, channel_id: int
 ) -> Analysis | None:
     """Получить кэшированный анализ, если не старше CACHE_TTL_HOURS."""
-    ttl = datetime.now(timezone.utc) - timedelta(hours=settings.CACHE_TTL_HOURS)
+    ttl = datetime.now(UTC) - timedelta(hours=settings.CACHE_TTL_HOURS)
     result = await session.execute(
-        select(Analysis)
-        .where(Analysis.channel_id == channel_id, Analysis.created_at >= ttl)
+        select(Analysis).where(
+            Analysis.channel_id == channel_id, Analysis.created_at >= ttl
+        )
     )
     return result.scalar_one_or_none()
 
@@ -234,43 +230,50 @@ async def save_analysis(
     posts_count: int,
 ) -> Analysis:
     """Сохранить или обновить анализ канала."""
-    stmt = pg_insert(Analysis).values(
-        channel_id=channel_id,
-        tagline=tagline,
-        about=about,
-        audience=audience,
-        style=style,
-        avg_views=avg_views,
-        avg_reactions=avg_reactions,
-        avg_comments=avg_comments,
-        posts_count=posts_count,
-        created_at=datetime.now(timezone.utc),
-    ).on_conflict_do_update(
-        index_elements=["channel_id"],
-        set_={
-            "tagline": tagline,
-            "about": about,
-            "audience": audience,
-            "style": style,
-            "avg_views": avg_views,
-            "avg_reactions": avg_reactions,
-            "avg_comments": avg_comments,
-            "posts_count": posts_count,
-            "created_at": datetime.now(timezone.utc),
-        },
-    ).returning(Analysis)
+    stmt = (
+        pg_insert(Analysis)
+        .values(
+            channel_id=channel_id,
+            tagline=tagline,
+            about=about,
+            audience=audience,
+            style=style,
+            avg_views=avg_views,
+            avg_reactions=avg_reactions,
+            avg_comments=avg_comments,
+            posts_count=posts_count,
+            created_at=datetime.now(UTC),
+        )
+        .on_conflict_do_update(
+            index_elements=["channel_id"],
+            set_={
+                "tagline": tagline,
+                "about": about,
+                "audience": audience,
+                "style": style,
+                "avg_views": avg_views,
+                "avg_reactions": avg_reactions,
+                "avg_comments": avg_comments,
+                "posts_count": posts_count,
+                "created_at": datetime.now(UTC),
+            },
+        )
+        .returning(Analysis)
+    )
     result = await session.execute(stmt)
     await session.commit()
     return result.scalar_one()
 
 
-# ─── Channel Lists ──────────────────────────────────────
+# Channel Lists
+
 
 async def get_default_list(session: AsyncSession, user_id: int) -> ChannelList | None:
     """Получить дефолтный список каналов пользователя."""
     result = await session.execute(
-        select(ChannelList)
-        .where(ChannelList.user_id == user_id, ChannelList.is_default == True)
+        select(ChannelList).where(
+            ChannelList.user_id == user_id, ChannelList.is_default == True
+        )
     )
     return result.scalar_one_or_none()
 
@@ -290,14 +293,18 @@ async def add_channel_to_list(
     session: AsyncSession, list_id: int, channel_id: int
 ) -> None:
     """Добавить канал в список."""
-    stmt = pg_insert(ChannelListItem).values(
-        list_id=list_id, channel_id=channel_id
-    ).on_conflict_do_nothing()
+    stmt = (
+        pg_insert(ChannelListItem)
+        .values(list_id=list_id, channel_id=channel_id)
+        .on_conflict_do_nothing()
+    )
     await session.execute(stmt)
     await session.commit()
 
 
-async def remove_channel_from_list(session: AsyncSession, list_id: int, channel_id: int) -> None:
+async def remove_channel_from_list(
+    session: AsyncSession, list_id: int, channel_id: int
+) -> None:
     """Удалить канал из списка."""
     await session.execute(
         delete(ChannelListItem).where(
@@ -316,14 +323,6 @@ async def get_list_channels(session: AsyncSession, list_id: int) -> list[Channel
         .where(ChannelListItem.list_id == list_id)
     )
     result = await session.execute(stmt)
-    return list(result.scalars().all())
-
-
-async def get_user_lists(session: AsyncSession, user_id: int) -> list[ChannelList]:
-    """Получить все списки каналов пользователя."""
-    result = await session.execute(
-        select(ChannelList).where(ChannelList.user_id == user_id)
-    )
     return list(result.scalars().all())
 
 
@@ -359,7 +358,8 @@ async def get_scheduled_lists(session: AsyncSession) -> list[ChannelList]:
     return list(result.scalars().all())
 
 
-# ─── Digests ────────────────────────────────────────────
+# Digests
+
 
 async def save_digest(
     session: AsyncSession,
@@ -387,19 +387,6 @@ async def save_digest(
     await session.commit()
     await session.refresh(digest)
     return digest
-
-
-async def update_digest_status(
-    session: AsyncSession, digest_id: int, status: DigestStatus
-) -> None:
-    """Обновить статус дайджеста."""
-    values = {"status": status}
-    if status == DigestStatus.sent:
-        values["sent_at"] = datetime.now(timezone.utc)
-    await session.execute(
-        update(Digest).where(Digest.id == digest_id).values(**values)
-    )
-    await session.commit()
 
 
 async def get_user_digests(

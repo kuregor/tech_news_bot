@@ -5,11 +5,14 @@ from aiogram import F, Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 
-from bot.utils import not_a_command, send_long_message
 from bot.keyboards.inline import close_keyboard, period_keyboard
 from bot.states import CompareStates
-from core.compare import CompareService
-from db.session import async_session
+from bot.utils import not_a_command, send_long_message
+from core.compare import (
+    format_compare,
+    format_compare_rich,
+    run_compare_pipeline,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -33,7 +36,18 @@ def _extract_usernames(text: str) -> list[str]:
     return result
 
 
-# ─── /compare — старт ───────────────────────────────────
+# /compare — старт
+
+
+async def start_compare(message: types.Message, state: FSMContext) -> None:
+    """Точка входа в /compare без аргументов — из reply-кнопки меню."""
+    await state.clear()
+    await message.answer(
+        "⚖️ Введите ID двух каналов сразу или по-отдельности:",
+        reply_markup=close_keyboard(),
+    )
+    await state.set_state(CompareStates.waiting_first_input)
+
 
 @router.message(Command("compare"))
 async def cmd_compare(message: types.Message, state: FSMContext) -> None:
@@ -60,7 +74,8 @@ async def cmd_compare(message: types.Message, state: FSMContext) -> None:
     await state.set_state(CompareStates.waiting_first_input)
 
 
-# ─── Шаг 1: ввод одного или двух каналов сразу ──────────
+# Шаг 1: ввод одного или двух каналов сразу
+
 
 @router.message(CompareStates.waiting_first_input, not_a_command)
 async def on_first_input(message: types.Message, state: FSMContext) -> None:
@@ -87,7 +102,8 @@ async def on_first_input(message: types.Message, state: FSMContext) -> None:
     await message.answer("Отправьте @username каналов.")
 
 
-# ─── Шаг 2: второй канал ────────────────────────────────
+# Шаг 2: второй канал
+
 
 @router.message(CompareStates.waiting_second_input, not_a_command)
 async def on_second_input(message: types.Message, state: FSMContext) -> None:
@@ -112,7 +128,8 @@ async def on_second_input(message: types.Message, state: FSMContext) -> None:
     await state.set_state(CompareStates.choosing_period)
 
 
-# ─── Шаг 3: период и генерация ──────────────────────────
+# Шаг 3: период и генерация
+
 
 @router.callback_query(CompareStates.choosing_period, F.data.startswith("period:"))
 async def on_period(callback: types.CallbackQuery, state: FSMContext) -> None:
@@ -131,20 +148,32 @@ async def on_period(callback: types.CallbackQuery, state: FSMContext) -> None:
             pass
 
     try:
-        result = await CompareService.run_compare_pipeline(
+        result = await run_compare_pipeline(
             ch1_username=data["ch1_username"],
             ch2_username=data["ch2_username"],
             period_days=period_days,
             progress_callback=update_progress,
         )
 
-        formatted = CompareService.format_compare(result)
+        formatted = format_compare(result)
+        rich_html = format_compare_rich(result)
         try:
             await progress_msg.delete()
         except Exception:
             pass
 
-        await send_long_message(callback.message, formatted, parse_mode="HTML")
+        # Пробуем структурную rich-страницу; при сбое отправки
+        # откатываемся на текстовый HTML-вариант.
+        try:
+            from aiogram.types import InputRichMessage
+
+            await callback.bot.send_rich_message(
+                chat_id=callback.message.chat.id,
+                rich_message=InputRichMessage(html=rich_html),
+            )
+        except Exception:
+            logger.warning("send_rich_message не удался, откат на HTML", exc_info=True)
+            await send_long_message(callback.message, formatted, parse_mode="HTML")
 
     except Exception as e:
         logger.exception("Ошибка при сравнении каналов")

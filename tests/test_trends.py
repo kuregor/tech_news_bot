@@ -1,23 +1,35 @@
 """Unit-тесты модуля core/trends.py."""
-import pytest
-from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock
 
+import asyncio
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+import core.trends as trends_mod
+from core import topics
 from core.trends import (
-    _split_halves,
     _channel_averages,
-    _viral_score,
-    _truncate,
-    _fmt_num,
     _decline_posts,
+    _fmt_num,
+    _split_halves,
+    _truncate,
+    _viral_score,
+    format_trends,
+    run_trends_pipeline,
 )
 
 
-def _make_post(days_ago: int, channel_id: int = 1,
-               views: int = 100, reactions: int = 10, forwards: int = 5):
+def _make_post(
+    days_ago: int,
+    channel_id: int = 1,
+    views: int = 100,
+    reactions: int = 10,
+    forwards: int = 5,
+):
     """Фабрика тестовых постов через MagicMock."""
     post = MagicMock()
-    post.date = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    post.date = datetime.now(UTC) - timedelta(days=days_ago)
     post.channel_id = channel_id
     post.views = views
     post.reactions = reactions
@@ -25,7 +37,8 @@ def _make_post(days_ago: int, channel_id: int = 1,
     return post
 
 
-# ─── _split_halves ──────────────────────────────────────────────────────────
+# _split_halves
+
 
 class TestSplitHalves:
 
@@ -35,13 +48,13 @@ class TestSplitHalves:
         - Сценарий: равномерное распределение постов по половинам 14-дневного периода
         - Результат: по 2 поста в каждой половине
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         period_from = now - timedelta(days=14)
         posts = [
             _make_post(13),  # первая половина
             _make_post(10),  # первая половина
-            _make_post(3),   # вторая половина
-            _make_post(1),   # вторая половина
+            _make_post(3),  # вторая половина
+            _make_post(1),  # вторая половина
         ]
         first, second = _split_halves(posts, period_from, now)
         assert len(first) == 2
@@ -53,7 +66,7 @@ class TestSplitHalves:
         - Сценарий: пустой список постов
         - Результат: обе половины пустые
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         first, second = _split_halves([], now - timedelta(days=7), now)
         assert first == []
         assert second == []
@@ -64,14 +77,15 @@ class TestSplitHalves:
         - Сценарий: все посты — в начале периода (первая половина)
         - Результат: first содержит все посты, second пуст
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         posts = [_make_post(13), _make_post(12), _make_post(11)]
         first, second = _split_halves(posts, now - timedelta(days=14), now)
         assert len(first) == 3
         assert len(second) == 0
 
 
-# ─── _channel_averages ──────────────────────────────────────────────────────
+# _channel_averages
+
 
 class TestChannelAverages:
 
@@ -103,7 +117,8 @@ class TestChannelAverages:
         assert stats[2] == (0.0, 0.0, 0.0)
 
 
-# ─── _viral_score ────────────────────────────────────────────────────────────
+# _viral_score
+
 
 class TestViralScore:
 
@@ -130,7 +145,8 @@ class TestViralScore:
         assert isinstance(score, float)
 
 
-# ─── _truncate ───────────────────────────────────────────────────────────────
+# _truncate
+
 
 class TestTruncate:
 
@@ -155,7 +171,8 @@ class TestTruncate:
         assert _truncate(short, max_len=140) == short
 
 
-# ─── _fmt_num ────────────────────────────────────────────────────────────────
+# _fmt_num
+
 
 class TestFmtNum:
 
@@ -176,7 +193,8 @@ class TestFmtNum:
         assert _fmt_num(15000) == "15 000"
 
 
-# ─── _decline_posts ──────────────────────────────────────────────────────────
+# _decline_posts
+
 
 class TestDeclinePosts:
 
@@ -186,9 +204,102 @@ class TestDeclinePosts:
         - Сценарий: все формы склонения (1, 2-4, 5+, 11-19)
         - Результат: корректная форма слова "пост"
         """
-        assert _decline_posts(1)  == "1 пост"
-        assert _decline_posts(2)  == "2 поста"
-        assert _decline_posts(4)  == "4 поста"
-        assert _decline_posts(5)  == "5 постов"
+        assert _decline_posts(1) == "1 пост"
+        assert _decline_posts(2) == "2 поста"
+        assert _decline_posts(4) == "4 поста"
+        assert _decline_posts(5) == "5 постов"
         assert _decline_posts(11) == "11 постов"
         assert _decline_posts(21) == "21 пост"
+
+
+# run_trends_pipeline: счёт по slug, исключение other
+
+
+def _make_full_post(
+    pid: int,
+    days_ago: int,
+    channel_id: int = 1,
+    views: int = 100,
+    reactions: int = 10,
+    forwards: int = 5,
+    comments: int = 2,
+):
+    post = MagicMock()
+    post.id = pid
+    post.tg_id = pid
+    post.text = f"post {pid}"
+    post.date = datetime.now(UTC) - timedelta(days=days_ago)
+    post.channel_id = channel_id
+    post.views = views
+    post.reactions = reactions
+    post.forwards = forwards
+    post.comments = comments
+    return post
+
+
+class TestRunTrendsPipeline:
+
+    def test_counts_by_slug_excludes_other(self):
+        """
+        - Тестируется run_trends_pipeline
+        - Сценарий: тема ai растёт (1→3), тема other присутствует, но должна
+          игнорироваться при подсчёте rising/declining/new
+        - Результат: ai в rising; other не встречается ни в одном блоке;
+          все ярлыки — slug из закрытого набора
+        """
+        posts = [
+            _make_full_post(1, 13),  # ai, первая половина
+            _make_full_post(2, 12),  # other, первая половина
+            _make_full_post(3, 11),  # other, первая половина
+            _make_full_post(6, 4),  # ai, вторая половина
+            _make_full_post(7, 3),  # ai, вторая половина
+            _make_full_post(8, 2),  # ai, вторая половина
+            _make_full_post(9, 1),  # other, вторая половина
+        ]
+        classification = {
+            1: "ai",
+            2: "other",
+            3: "other",
+            6: "ai",
+            7: "ai",
+            8: "ai",
+            9: "other",
+        }
+
+        fake_parser = MagicMock()
+        fake_parser.parse_channel_posts = AsyncMock(return_value=[])
+
+        with patch("core.parser.telegram_parser", fake_parser), patch.object(
+            trends_mod, "batch_upsert_posts", AsyncMock()
+        ), patch.object(
+            trends_mod, "get_posts_by_channels", AsyncMock(return_value=posts)
+        ), patch.object(
+            trends_mod.ai_client,
+            "classify_posts_for_trends",
+            AsyncMock(return_value=classification),
+        ):
+            result = asyncio.run(
+                run_trends_pipeline(
+                    session=MagicMock(),
+                    channel_ids=[1],
+                    channel_names=["test"],
+                    period_days=14,
+                )
+            )
+
+        assert not result.get("empty")
+        all_labels = [
+            t["label"]
+            for block in ("rising", "declining", "new_topics")
+            for t in result.get(block, [])
+        ]
+        assert "ai" in [t["label"] for t in result["rising"]]
+        assert "other" not in all_labels
+        assert all(
+            lbl in topics.ALLOWED_SLUGS and lbl != topics.OTHER for lbl in all_labels
+        )
+
+        # Рендер: slug превращается в человекочитаемый label и emoji из таксономии
+        rendered = format_trends(result)
+        assert "ИИ" in rendered
+        assert "🤖" in rendered

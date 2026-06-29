@@ -6,6 +6,7 @@ from typing import Any
 from cerebras.cloud.sdk import Cerebras
 
 from config import settings
+from core import topics as taxonomy
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,9 @@ def _merge_topics(r1: dict, r2: dict, n1: int, n2: int) -> dict:
             merged[t["label"]] = {**t, "percentage": t["percentage"] * w2}
 
     top_topics = sorted(merged.values(), key=lambda x: x["percentage"], reverse=True)
-    kws = list(dict.fromkeys(r1.get("trending_keywords", []) + r2.get("trending_keywords", [])))[:10]
+    kws = list(
+        dict.fromkeys(r1.get("trending_keywords", []) + r2.get("trending_keywords", []))
+    )[:10]
     tags = list(dict.fromkeys(r1.get("hashtags", []) + r2.get("hashtags", [])))[:10]
     return {"top_topics": top_topics, "trending_keywords": kws, "hashtags": tags}
 
@@ -129,10 +132,12 @@ class AIClient:
                     raise  # ретраить тот же промпт бессмысленно
                 logger.warning(
                     "LLM ошибка (попытка %d/%d): %s",
-                    attempt, retries, e,
+                    attempt,
+                    retries,
+                    e,
                 )
                 if attempt < retries:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(2**attempt)
                     continue
                 raise
 
@@ -160,10 +165,13 @@ class AIClient:
             "}\n"
             "top_topics — основные темы канала (5-8 штук), percentage — доля постов на эту тему (сумма = 1.0).\n"
             "trending_keywords — 5-10 актуальных ключевых слов.\n"
-            "hashtags — 5-10 подходящих хэштегов."
+            "hashtags — 5-10 подходящих хэштегов НА РУССКОМ ЯЗЫКЕ (кириллицей, например #нейросети)."
         )
         truncated = [t[:200] for t in posts_texts if t]
-        user_prompt = "Проанализируй посты Telegram-канала и определи темы:\n\n" + "\n---\n".join(truncated)
+        user_prompt = (
+            "Проанализируй посты Telegram-канала и определи темы:\n\n"
+            + "\n---\n".join(truncated)
+        )
 
         try:
             raw = await self._call_llm(system_prompt, user_prompt)
@@ -223,7 +231,8 @@ class AIClient:
                     logger.warning(
                         "LLM context_length_exceeded в analyze_description: "
                         "сокращаем с %d до %d постов",
-                        len(texts), len(texts) // 2,
+                        len(texts),
+                        len(texts) // 2,
                     )
                     texts = texts[: len(texts) // 2]
                     continue
@@ -255,24 +264,26 @@ class AIClient:
             max_tokens (int): лимит токенов ответа.
 
         Возвращает:
-            list[dict]: [{"id": post_id, "topic": "...", "emoji": "..."}, ...].
+            list[dict]: [{"id": post_id, "topic": "<slug>"}, ...] — slug из закрытого набора.
         """
         system_prompt = (
             "Ты редактор новостного дайджеста. Отвечай ТОЛЬКО валидным JSON без пояснений.\n"
-            "Тебе даны посты с id. Определи для каждого поста одну доминирующую тему.\n"
-            "Объединяй похожие темы под одним названием (например, все про AI/ML → одна тема).\n"
-            "Старайся использовать 3-6 тем на весь список.\n"
+            "Тебе даны посты с id. Для каждого поста выбери ровно одну тему из списка ниже.\n"
+            "Используй РОВНО slug темы (левая колонка), без изменений. Если пост ни к одной "
+            "теме не подходит — выбирай other.\n"
+            "Разрешённые темы (slug — описание):\n"
+            f"{taxonomy.allowed_block()}\n"
             "Формат ответа — JSON-массив:\n"
-            '[{"id": 123, "topic": "ИИ и нейросети", "emoji": "🤖"}, ...]\n'
-            "Каждый элемент содержит id поста, короткое название темы на русском и подходящий emoji."
+            '[{"id": 123, "topic": "ai"}, ...]\n'
+            "Каждый элемент содержит id поста и slug темы."
         )
-        posts_block = "\n".join(
-            f"[id={p['id']}] {p['text']}" for p in posts_data
-        )
+        posts_block = "\n".join(f"[id={p['id']}] {p['text']}" for p in posts_data)
         user_prompt = f"Классифицируй эти посты по темам:\n\n{posts_block}"
 
         try:
-            raw = await self._call_llm(system_prompt, user_prompt, max_tokens=max_tokens)
+            raw = await self._call_llm(
+                system_prompt, user_prompt, max_tokens=max_tokens
+            )
         except Exception as e:
             if "context_length_exceeded" in str(e) and len(posts_data) > 1:
                 logger.warning(
@@ -290,7 +301,19 @@ class AIClient:
         result = _parse_json(raw)
         if isinstance(result, dict) and "posts" in result:
             result = result["posts"]
-        return result
+
+        # Приводим тему к закрытому набору slug; неизвестное → other.
+        normalized = []
+        for item in result:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            normalized.append(
+                {
+                    "id": item["id"],
+                    "topic": taxonomy.normalize(item.get("topic", "")),
+                }
+            )
+        return normalized
 
     async def classify_posts_for_trends(self, posts: list) -> dict[int, str]:
         """Назначение: классифицировать посты по темам для /trends.
@@ -305,7 +328,7 @@ class AIClient:
             dict[int, str]: {post_id: topic}.
         """
         BATCH = 30
-        chunks = [posts[i:i + BATCH] for i in range(0, len(posts), BATCH)]
+        chunks = [posts[i : i + BATCH] for i in range(0, len(posts), BATCH)]
 
         def _sanitize(t: str) -> str:
             return t.replace("\n", " ").replace('"', "'")[:80]
@@ -313,7 +336,11 @@ class AIClient:
         async def _classify_chunk(chunk):
             data = [{"id": p.id, "text": _sanitize(p.text or "")} for p in chunk]
             results = await self.classify_posts_by_topic(data)
-            return {r["id"]: r.get("topic", "") for r in results if isinstance(r, dict)}
+            return {
+                r["id"]: r.get("topic", taxonomy.OTHER)
+                for r in results
+                if isinstance(r, dict)
+            }
 
         mappings = await asyncio.gather(*[_classify_chunk(c) for c in chunks])
         merged: dict[int, str] = {}
@@ -323,8 +350,10 @@ class AIClient:
 
     async def compare_styles(
         self,
-        ch1_name: str, ch1_posts: list[str],
-        ch2_name: str, ch2_posts: list[str],
+        ch1_name: str,
+        ch1_posts: list[str],
+        ch2_name: str,
+        ch2_posts: list[str],
     ) -> dict[str, str]:
         """Назначение: сравнить стили подачи двух каналов через LLM.
 

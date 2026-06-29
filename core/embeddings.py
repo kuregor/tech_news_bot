@@ -1,5 +1,4 @@
 import logging
-from typing import Optional
 
 import aiohttp
 import chromadb
@@ -23,7 +22,7 @@ class EmbeddingService:
         self._client: chromadb.HttpClient | None = None
 
     def get_chroma_client(self) -> chromadb.HttpClient:
-        """Назначение: лениво создать и вернуть HTTP-клиент ChromaDB.
+        """Назначение: создать и вернуть HTTP-клиент ChromaDB.
 
         Возвращает:
             chromadb.HttpClient: единственный на экземпляр клиент.
@@ -33,7 +32,9 @@ class EmbeddingService:
             url = settings.CHROMADB_URL.rstrip("/")
             # Убираем http:// или https://
             stripped = url.split("://", 1)[-1]
-            host, port_str = stripped.rsplit(":", 1) if ":" in stripped else (stripped, "8000")
+            host, port_str = (
+                stripped.rsplit(":", 1) if ":" in stripped else (stripped, "8000")
+            )
             self._client = chromadb.HttpClient(host=host, port=int(port_str))
             logger.info("ChromaDB клиент подключён к %s", settings.CHROMADB_URL)
         return self._client
@@ -54,7 +55,7 @@ class EmbeddingService:
             metadata={"hnsw:space": "cosine"},
         )
 
-    # ─── Ollama: получение эмбеддингов ──────────────────────
+    # Ollama: получение эмбеддингов
 
     async def get_embedding(self, text: str) -> list[float]:
         """Назначение: получить эмбеддинг текста через Ollama /v1/embeddings.
@@ -73,7 +74,11 @@ class EmbeddingService:
             "Authorization": f"Bearer {settings.EMBED_API_KEY}",
             "Content-Type": "application/json",
         }
-        logger.info("Запрос эмбеддинга к %s (модель: %s)", settings.EMBED_BASE_URL, settings.EMBED_MODEL)
+        logger.info(
+            "Запрос эмбеддинга к %s (модель: %s)",
+            settings.EMBED_BASE_URL,
+            settings.EMBED_MODEL,
+        )
         timeout = aiohttp.ClientTimeout(total=120)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
@@ -83,11 +88,15 @@ class EmbeddingService:
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    raise RuntimeError(f"Ollama embeddings ошибка {resp.status}: {body}")
+                    raise RuntimeError(
+                        f"Ollama embeddings ошибка {resp.status}: {body}"
+                    )
                 data = await resp.json()
                 return data["data"][0]["embedding"]
 
-    async def get_embeddings_batch(self, texts: list[str], chunk_size: int = 20) -> list[list[float]]:
+    async def get_embeddings_batch(
+        self, texts: list[str], chunk_size: int = 20
+    ) -> list[list[float]]:
         """Назначение: получить эмбеддинги для списка текстов чанками.
 
         Параметры:
@@ -106,7 +115,11 @@ class EmbeddingService:
             "Content-Type": "application/json",
         }
         result: list[list[float]] = []
-        logger.info("Batch-эмбеддинги для %d текстов через %s", len(texts), settings.EMBED_BASE_URL)
+        logger.info(
+            "Batch-эмбеддинги для %d текстов через %s",
+            len(texts),
+            settings.EMBED_BASE_URL,
+        )
         timeout = aiohttp.ClientTimeout(total=120)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for i in range(0, len(texts), chunk_size):
@@ -118,13 +131,15 @@ class EmbeddingService:
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
-                        raise RuntimeError(f"Embedding service ошибка {resp.status}: {body}")
+                        raise RuntimeError(
+                            f"Embedding service ошибка {resp.status}: {body}"
+                        )
                     data = await resp.json()
                     items = sorted(data["data"], key=lambda x: x["index"])
                     result.extend(item["embedding"] for item in items)
         return result
 
-    # ─── ChromaDB: хранение и поиск ─────────────────────────
+    # ChromaDB: хранение и поиск
 
     def upsert_channel_embedding(
         self,
@@ -149,28 +164,6 @@ class EmbeddingService:
         )
         logger.info("Вектор канала %d сохранён в ChromaDB", channel_id)
 
-    def upsert_post_embedding(
-        self,
-        post_id: int,
-        embedding: list[float],
-        metadata: dict | None = None,
-    ) -> None:
-        """Назначение: сохранить вектор поста в ChromaDB.
-
-        Параметры:
-            post_id (int): идентификатор поста.
-            embedding (list[float]): вектор поста.
-            metadata (dict | None): дополнительные метаданные.
-        """
-        collection = self._get_post_collection()
-        meta = metadata or {}
-        meta["post_id"] = post_id
-        collection.upsert(
-            ids=[f"post_{post_id}"],
-            embeddings=[embedding],
-            metadatas=[meta],
-        )
-
     def upsert_post_embeddings_batch(
         self,
         post_ids: list[int],
@@ -191,45 +184,6 @@ class EmbeddingService:
         metas = metadatas or [{"post_id": pid} for pid in post_ids]
         collection.upsert(ids=ids, embeddings=embeddings, metadatas=metas)
         logger.info("Сохранено %d векторов постов в ChromaDB", len(post_ids))
-
-    def search_similar_posts(
-        self,
-        query_embedding: list[float],
-        top_k: int = 10,
-        channel_ids: list[int] | None = None,
-    ) -> list[tuple[int, float]]:
-        """Назначение: найти похожие посты по вектору запроса.
-
-        Параметры:
-            query_embedding (list[float]): вектор запроса.
-            top_k (int): максимум результатов.
-            channel_ids (list[int] | None): ограничение по каналам.
-
-        Возвращает:
-            list[tuple[int, float]]: [(post_id, distance), ...].
-        """
-        collection = self._get_post_collection()
-        where = None
-        if channel_ids:
-            if len(channel_ids) == 1:
-                where = {"channel_id": channel_ids[0]}
-            else:
-                where = {"channel_id": {"$in": channel_ids}}
-
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            where=where,
-            include=["distances", "metadatas"],
-        )
-
-        pairs = []
-        if results["ids"] and results["ids"][0]:
-            for i, doc_id in enumerate(results["ids"][0]):
-                post_id = results["metadatas"][0][i]["post_id"]
-                distance = results["distances"][0][i] if results["distances"] else 0.0
-                pairs.append((post_id, distance))
-        return pairs
 
     def deduplicate_by_embeddings(
         self,

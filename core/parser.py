@@ -1,11 +1,11 @@
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from telethon import TelegramClient
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import Channel as TgChannel
+from telethon.tl.types import ChatReactionsAll, ChatReactionsSome
 
-from config import settings, BASE_DIR
+from config import BASE_DIR, settings
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ class TelegramParser:
         self._client: TelegramClient | None = None
 
     async def get_client(self) -> TelegramClient:
-        """Назначение: лениво создать и подключить клиент Telethon.
+        """Назначение:  создать и подключить клиент Telethon.
 
         Возвращает:
             TelegramClient: подключённый клиент user-account.
@@ -68,9 +68,16 @@ class TelegramParser:
             "title": entity.title,
             "description": full_chat.about or "",
             "subscribers_count": full_chat.participants_count or 0,
+            # Реакции включены только при ChatReactionsAll/Some;
+            # None и ChatReactionsNone означают, что реакции выключены.
+            "reactions_enabled": isinstance(
+                full_chat.available_reactions, (ChatReactionsAll, ChatReactionsSome)
+            ),
         }
 
-    async def parse_channel_posts(self, username: str, limit: int | None = None) -> list[dict]:
+    async def parse_channel_posts(
+        self, username: str, limit: int | None = None
+    ) -> list[dict]:
         """Назначение: спарсить последние посты канала.
 
         Параметры:
@@ -101,15 +108,21 @@ class TelegramParser:
             if message.replies and message.replies.replies:
                 comments_count = message.replies.replies
 
-            posts.append({
-                "tg_id": message.id,
-                "text": message.text,
-                "views": message.views or 0,
-                "reactions": reactions_count,
-                "comments": comments_count,
-                "forwards": message.forwards or 0,
-                "date": message.date.replace(tzinfo=timezone.utc) if message.date else datetime.now(timezone.utc),
-            })
+            posts.append(
+                {
+                    "tg_id": message.id,
+                    "text": message.text,
+                    "views": message.views or 0,
+                    "reactions": reactions_count,
+                    "comments": comments_count,
+                    "forwards": message.forwards or 0,
+                    "date": (
+                        message.date.replace(tzinfo=UTC)
+                        if message.date
+                        else datetime.now(UTC)
+                    ),
+                }
+            )
 
         logger.info("Спарсено %d постов из @%s", len(posts), username.lstrip("@"))
         return posts

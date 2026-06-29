@@ -10,17 +10,16 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.redis import RedisStorage
 from redis.asyncio import Redis
 
+from bot.handlers.analyze import router as analyze_router
+from bot.handlers.common import router as common_router
+from bot.handlers.compare import router as compare_router
+from bot.handlers.digest import router as digest_router
+from bot.handlers.trends import router as trends_router
 from config import settings
 from core.parser import telegram_parser
 from core.scheduler import digest_scheduler
 from db.models import Base
 from db.session import engine
-
-from bot.handlers.common import router as common_router
-from bot.handlers.analyze import router as analyze_router
-from bot.handlers.digest import router as digest_router
-from bot.handlers.trends import router as trends_router
-from bot.handlers.compare import router as compare_router
 
 # Создаём папку logs рядом с main.py
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -57,20 +56,25 @@ async def _init_db(retries: int = 10, delay: float = 3.0) -> None:
                 raise
             logger.warning(
                 "Postgres недоступен (попытка %d/%d): %s. Повтор через %.0f с",
-                attempt, retries, exc, delay,
+                attempt,
+                retries,
+                exc,
+                delay,
             )
             await asyncio.sleep(delay)
 
 
 async def on_startup(bot: Bot) -> None:
     await _init_db()
-    await bot.set_my_commands([
-        types.BotCommand(command="analyze", description="Анализ канала"),
-        types.BotCommand(command="digest", description="Дайджест лучших постов"),
-        types.BotCommand(command="trends", description="Тренды тем"),
-        types.BotCommand(command="compare", description="Сравнение каналов"),
-        types.BotCommand(command="cancel", description="Отменить текущую операцию"),
-    ])
+    await bot.set_my_commands(
+        [
+            types.BotCommand(command="analyze", description="Анализ канала"),
+            types.BotCommand(command="digest", description="Дайджест лучших постов"),
+            types.BotCommand(command="trends", description="Тренды тем"),
+            types.BotCommand(command="compare", description="Сравнение каналов"),
+            types.BotCommand(command="cancel", description="Отменить текущую операцию"),
+        ]
+    )
     await digest_scheduler.setup_scheduler(bot)
     logger.info("Бот запущен")
 

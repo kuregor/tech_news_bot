@@ -129,7 +129,7 @@
 - `BOT_TOKEN` — токен бота от [@BotFather](https://t.me/BotFather).
 - `TG_API_ID`, `TG_API_HASH`, `TG_PHONE` — данные для чтения каналов через Telethon (получаются на [my.telegram.org](https://my.telegram.org)).
 - `LLM_API_KEY`, `LLM_MODEL`, `LLM_BASE_URL` — доступ к LLM (OpenAI-совместимый API, напр. OpenRouter).
-- `EMBED_MODEL` — название модели эмбеддингов в Ollama. Эту модель нужно один раз загрузить в Ollama — см. Шаг 4.
+- `EMBED_MODEL` — название модели эмбеддингов в Ollama (например, `nomic-embed-text`). Эту модель нужно один раз загрузить в Ollama — см. Шаг 4.
 - Остальные адреса баз данных и сервисов уже прописаны в `docker-compose.yml`.
 
 ### Шаг 2. Авторизуйте чтение каналов (один раз)
@@ -169,7 +169,7 @@ docker compose down
 Ollama поднимается в Docker **пустой** — нужную модель эмбеддингов в неё надо загрузить один раз. Сделайте это после `docker compose up -d`, указав ту же модель, что прописана в `EMBED_MODEL`:
 
 ```powershell
-docker exec -it ollama ollama pull qwen3-embedding
+docker exec -it ollama ollama pull nomic-embed-text
 ```
 
 Модель сохраняется в volume `ollama_models`, поэтому при перезапусках качать заново не нужно. Проверить, что модель на месте:
@@ -177,6 +177,8 @@ docker exec -it ollama ollama pull qwen3-embedding
 ```powershell
 docker exec -it ollama ollama list
 ```
+
+> Если в логах бота встречается ошибка вроде `model "..." not found` — значит, модель из `EMBED_MODEL` ещё не загружена в Ollama. Выполните `ollama pull` с этим именем.
 
 ### Подсказки
 

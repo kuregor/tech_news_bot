@@ -2,6 +2,8 @@ import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from core.digest import format_digest, run_digest_pipeline
+from db.repository import get_list_channels, get_scheduled_lists
 from db.session import async_session
 
 logger = logging.getLogger(__name__)
@@ -17,7 +19,7 @@ class DigestScheduler:
     """
 
     def __init__(self) -> None:
-        self._scheduler = AsyncIOScheduler()
+        self._scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
     async def setup_scheduler(self, bot) -> None:
         """Назначение: загрузить расписания из БД и запустить планировщик.
@@ -25,8 +27,6 @@ class DigestScheduler:
         Параметры:
             bot: экземпляр бота для отправки сообщений.
         """
-        from db.repository import get_list_channels, get_scheduled_lists
-
         async with async_session() as session:
             lists = await get_scheduled_lists(session)
             jobs_data = [
@@ -91,6 +91,7 @@ class DigestScheduler:
             trigger="cron",
             id=f"digest_{channel_list_id}",
             replace_existing=True,
+            misfire_grace_time=300,
             kwargs={
                 "bot": bot,
                 "channel_list_id": channel_list_id,
@@ -102,7 +103,11 @@ class DigestScheduler:
         )
         logger.info(
             "Расписание добавлено: list_id=%d user_id=%d type=%s time=%d:%02d",
-            channel_list_id, user_id, schedule_type, schedule_hour, schedule_minute or 0,
+            channel_list_id,
+            user_id,
+            schedule_type,
+            schedule_hour,
+            schedule_minute or 0,
         )
 
     def remove_digest_job(self, channel_list_id: int) -> None:
@@ -129,22 +134,21 @@ class DigestScheduler:
             logger.error("Авторасписание list_id=%d: bot=None", channel_list_id)
             return
 
-        from core.digest import DigestService
-        from db.repository import get_list_channels
-
         try:
             async with async_session() as session:
                 channels = await get_list_channels(session, channel_list_id)
 
             if not channels:
-                logger.warning("Авторасписание list_id=%d: нет каналов", channel_list_id)
+                logger.warning(
+                    "Авторасписание list_id=%d: нет каналов", channel_list_id
+                )
                 return
 
             channel_ids = [c.id for c in channels]
             channel_names = [c.username for c in channels]
 
             async with async_session() as session:
-                result = await DigestService.run_digest_pipeline(
+                result = await run_digest_pipeline(
                     session=session,
                     channel_ids=channel_ids,
                     channel_names=channel_names,
@@ -154,7 +158,7 @@ class DigestScheduler:
                     channel_list_id=channel_list_id,
                 )
 
-            formatted = DigestService.format_digest(result)
+            formatted = format_digest(result)
 
             MAX_LEN = 4096
             if len(formatted) <= MAX_LEN:
@@ -173,7 +177,11 @@ class DigestScheduler:
                 for part in parts:
                     await bot.send_message(user_id, part)
 
-            logger.info("Авторасписание отправлен: list_id=%d user_id=%d", channel_list_id, user_id)
+            logger.info(
+                "Авторасписание отправлен: list_id=%d user_id=%d",
+                channel_list_id,
+                user_id,
+            )
 
         except Exception:
             logger.exception("Ошибка авторасписания list_id=%d", channel_list_id)

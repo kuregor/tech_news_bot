@@ -2,18 +2,28 @@ import html as html_mod
 import logging
 import statistics
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core import topics as taxonomy
 from core.ai import ai_client
+from core.formatting import (
+    _decline_channels,
+    _decline_posts,
+    _fmt_num,
+    _truncate,
+)
+from core.metrics import _channel_averages, _viral_score
+from core.parser import telegram_parser
 from db.models import Post
-from db.repository import get_posts_by_channels
+from db.repository import batch_upsert_posts, get_posts_by_channels
 
 logger = logging.getLogger(__name__)
 
-PERIOD_LABELS = {1: "24 часа", 7: "неделю", 14: "две недели"}
+PERIOD_LABELS = {1: "24 часа", 7: "за неделю", 14: "за две недели"}
 
 # Минимальное суммарное число упоминаний темы, чтобы учитывать её в трендах
 MIN_MENTIONS = 3
@@ -24,7 +34,7 @@ TOP_DECLINING = 5
 TOP_NEW = 5
 
 
-# ─── Помощники ──────────────────────────────────────────
+# Помощники
 
 
 def _split_halves(
@@ -39,39 +49,8 @@ def _split_halves(
     return first, second
 
 
-def _channel_averages(posts: list[Post]) -> dict[int, tuple[float, float, float]]:
-    """Средние views / reactions / forwards по каждому каналу за период."""
-    by_channel: dict[int, list[Post]] = defaultdict(list)
-    for p in posts:
-        by_channel[p.channel_id].append(p)
-    stats: dict[int, tuple[float, float, float]] = {}
-    for ch_id, ps in by_channel.items():
-        n = len(ps)
-        if not n:
-            stats[ch_id] = (1.0, 1.0, 1.0)
-            continue
-        avg_v = sum(p.views or 0 for p in ps) / n
-        avg_r = sum(p.reactions or 0 for p in ps) / n
-        avg_f = sum(p.forwards or 0 for p in ps) / n
-        stats[ch_id] = (avg_v, avg_r, avg_f)
-    return stats
+# Пайплайн
 
-
-def _viral_score(post: Post, ch_stats: dict[int, tuple[float, float, float]]) -> float:
-    """Нормализованный рейтинг вирусности поста относительно среднего канала."""
-    avg_v, avg_r, avg_f = ch_stats.get(post.channel_id, (1.0, 1.0, 1.0))
-    # Защита от деления на ноль — если среднее = 0, подставляем 1
-    avg_v = avg_v if avg_v > 0 else 1.0
-    avg_r = avg_r if avg_r > 0 else 1.0
-    avg_f = avg_f if avg_f > 0 else 1.0
-    return (
-        (post.views or 0) / avg_v * 0.4
-        + (post.reactions or 0) / avg_r * 0.4
-        + (post.forwards or 0) / avg_f * 0.2
-    )
-
-
-# ─── Пайплайн ───────────────────────────────────────────
 
 async def run_trends_pipeline(
     session: AsyncSession,
@@ -80,7 +59,7 @@ async def run_trends_pipeline(
     period_days: int,
     progress_callback: Callable[[str], Any] | None = None,
 ) -> dict:
-    """Назначение: полный пайплайн команды /trends (тренд-радар, AI-классификация тем).
+    """Полный пайплайн /trends: тренд-радар с AI-классификацией тем.
 
     Параметры:
         session (AsyncSession): сессия БД.
@@ -97,11 +76,21 @@ async def run_trends_pipeline(
         if progress_callback:
             await progress_callback(text)
 
-    period_to = datetime.now(timezone.utc)
+    period_to = datetime.now(UTC)
     period_from = period_to - timedelta(days=period_days)
 
+    # 0. Подтягиваем свежие посты из Telegram для каждого канала списка,
+    #    чтобы тренды считались по всем каналам, а не только по тем, что прошли /analyze.
+    await _progress("📡 Обновляем посты каналов... (1/5)")
+    for ch_id, ch_name in zip(channel_ids, channel_names):
+        try:
+            raw_posts = await telegram_parser.parse_channel_posts(ch_name)
+            await batch_upsert_posts(session, ch_id, raw_posts)
+        except Exception as e:
+            logger.warning("Не удалось обновить посты @%s: %s", ch_name, e)
+
     # 1. Посты за период
-    await _progress("⏳ Загружаем посты... (1/4)")
+    await _progress("⏳ Загружаем посты... (2/5)")
     posts = await get_posts_by_channels(session, channel_ids, period_from)
     if not posts:
         return {
@@ -112,7 +101,7 @@ async def run_trends_pipeline(
         }
 
     # 2. Деление на половины
-    await _progress("📊 Делим на половины... (2/4)")
+    await _progress("📊 Делим на половины... (3/5)")
     first, second = _split_halves(posts, period_from, period_to)
     n_first = len(first)
     n_second = len(second)
@@ -122,16 +111,17 @@ async def run_trends_pipeline(
     posts_map = {p.id: p for p in posts}
 
     # 3. Темы по постам — AI-классификация без зависимости от /analyze
-    await _progress("🤖 Классифицируем темы... (3/4)")
+    await _progress("🤖 Классифицируем темы... (4/5)")
     raw_classification = await ai_client.classify_posts_for_trends(posts)
+    # Темы — slug из закрытого набора; other в тренды не берём.
     topics_map: dict[int, list[str]] = {
         pid: [label]
         for pid, label in raw_classification.items()
-        if label and pid in posts_map
+        if label and label != taxonomy.OTHER and pid in posts_map
     }
 
     # 4. Подсчёт упоминаний и связка тем с постами
-    await _progress("🧮 Считаем тренды... (4/4)")
+    await _progress("🧮 Считаем тренды... (5/5)")
     first_counts: dict[str, int] = defaultdict(int)
     second_counts: dict[str, int] = defaultdict(int)
     topic_post_ids: dict[str, set[int]] = defaultdict(set)
@@ -164,12 +154,14 @@ async def run_trends_pipeline(
         # Новая тема: не было в первой половине
         if c1 == 0:
             avg_views = sum(views_list) / len(views_list) if views_list else 0
-            new_topics.append({
-                "label": label,
-                "posts_count": posts_count,
-                "avg_views": avg_views,
-                "second_count": c2,
-            })
+            new_topics.append(
+                {
+                    "label": label,
+                    "posts_count": posts_count,
+                    "avg_views": avg_views,
+                    "second_count": c2,
+                }
+            )
             continue
 
         # Нормализация по частоте внутри каждой половины
@@ -204,7 +196,7 @@ async def run_trends_pipeline(
     new_topics = new_topics[:TOP_NEW]
 
     # 6. Самый вирусный пост периода — нормализованная формула
-    await _progress("🔥 Ищем вирусные посты... (4/4)")
+    await _progress("🔥 Ищем вирусные посты... (5/5)")
     ch_stats = _channel_averages(posts)
     top_viral = max(posts, key=lambda p: _viral_score(p, ch_stats))
 
@@ -221,6 +213,7 @@ async def run_trends_pipeline(
             entry["sample_text"] = _truncate(best.text or "", 80)
             entry["sample_channel"] = ch
             entry["sample_url"] = f"https://t.me/{ch}/{best.tg_id}"
+            entry["sample_post"] = best
 
     return {
         "empty": False,
@@ -235,79 +228,19 @@ async def run_trends_pipeline(
     }
 
 
-# ─── Форматирование ─────────────────────────────────────
-
-def _fmt_num(n: int | float) -> str:
-    n = round(n)
-    if n < 10_000:
-        return str(n)
-    return f"{n:,}".replace(",", " ")
+# Форматирование
 
 
-_TOPIC_EMOJI: dict[str, str] = {
-    "финансы": "💰",
-    "технологии": "💻",
-    "интернет": "🌐",
-    "гаджеты": "📱",
-    "игры": "🎮",
-    "программирование": "⌨️",
-    "разработка": "⚙️",
-    "дизайн": "🎨",
-    "искусственный интеллект": "🤖",
-    "безопасность": "🔐",
-    "новости": "📰",
-    "события": "📰",
-    "обзоры": "📰",
-    "автомобил": "🚗",
-    "наука": "🔬",
-    "бизнес": "📊",
-    "данные": "📊",
-    "python": "🐍",
-    "мотивация": "💡",
-    "личность": "💡",
-    "разное": "📌",
-}
-
-
-def _topic_emoji(label: str) -> str:
-    lower = label.lower()
-    for key, emoji in _TOPIC_EMOJI.items():
-        if key in lower:
-            return emoji
-    return "•"
-
-
-def _truncate(text: str, max_len: int = 140) -> str:
-    text = (text or "").replace("\n", " ").strip()
-    if len(text) <= max_len:
-        return text
-    truncated = text[:max_len]
-    last_space = truncated.rfind(" ")
-    if last_space > 0:
-        truncated = truncated[:last_space]
-    return truncated + "..."
-
-
-def _decline_channels(n: int) -> str:
-    if 11 <= n % 100 <= 19:
-        return f"{n} каналов"
-    r = n % 10
-    if r == 1:
-        return f"{n} канал"
-    if 2 <= r <= 4:
-        return f"{n} канала"
-    return f"{n} каналов"
-
-
-def _decline_posts(n: int) -> str:
-    if 11 <= n % 100 <= 19:
-        return f"{n} постов"
-    r = n % 10
-    if r == 1:
-        return f"{n} пост"
-    if 2 <= r <= 4:
-        return f"{n} поста"
-    return f"{n} постов"
+def _post_metrics(post: Post) -> str:
+    """Строка метрик поста в едином стиле: 🗓 дата · 👁 · ❤️ · 💬 · ER."""
+    date_str = f"{post.date.day:02d}.{post.date.month:02d}"
+    views = post.views or 0
+    er = (post.reactions or 0) + (post.comments or 0)
+    er = f"{er / views * 100:.1f}" if views else "0"
+    return (
+        f"🗓 {date_str} · 👁 {_fmt_num(views)} · ❤️ {_fmt_num(post.reactions or 0)} · "
+        f"💬 {_fmt_num(post.comments or 0)} · ER <b>{er}%</b>"
+    )
 
 
 def format_trends(data: dict) -> str:
@@ -342,40 +275,45 @@ def format_trends(data: dict) -> str:
     if rising:
         lines.append("📈 <b>Набирает обороты:</b>")
         for t in rising:
-            emoji = _topic_emoji(t["label"])
+            emoji = taxonomy.emoji_for(t["label"])
             c1 = t.get("first_count", 0)
             c2 = t.get("second_count", 0)
             lines.append(
-                f"{emoji} {html_mod.escape(t['label'])} — "
+                f"{emoji} {html_mod.escape(taxonomy.label_for(t['label']))} — "
                 f"<b>+{round(t['growth'])}%</b> ({c1} → {_decline_posts(c2)})"
             )
             sample = t.get("sample_text")
             if sample:
                 url = t.get("sample_url", "")
                 ch = t.get("sample_channel", "")
-                lines.append(f'   └ <a href="{url}">«{html_mod.escape(sample)}»</a> @{ch}')
+                lines.append(
+                    f'   └ <a href="{url}">«{html_mod.escape(sample)}»</a> @{ch}'
+                )
+                sample_post = t.get("sample_post")
+                if sample_post is not None:
+                    lines.append(f"      {_post_metrics(sample_post)}")
         lines.append("")
 
     if new_topics:
         lines.append("🆕 <b>Появилось впервые:</b>")
         for t in new_topics:
-            emoji = _topic_emoji(t["label"])
+            emoji = taxonomy.emoji_for(t["label"])
             lines.append(
-                f"  {emoji} {html_mod.escape(t['label'])} · {t['posts_count']} постов"
+                f"  {emoji} {html_mod.escape(taxonomy.label_for(t['label']))} · {_decline_posts(t['posts_count'])}"
             )
         lines.append("")
 
     if declining:
         lines.append("📉 <b>Затихло:</b>")
         for t in declining:
-            emoji = _topic_emoji(t["label"])
+            emoji = taxonomy.emoji_for(t["label"])
             if round(abs(t["growth"])) >= 100:
                 lines.append(
-                    f"  {emoji} {html_mod.escape(t['label'])} — исчезло из эфира"
+                    f"  {emoji} {html_mod.escape(taxonomy.label_for(t['label']))} — исчезло из эфира"
                 )
             else:
                 lines.append(
-                    f"  {emoji} {html_mod.escape(t['label'])} — "
+                    f"  {emoji} {html_mod.escape(taxonomy.label_for(t['label']))} — "
                     f"−{round(abs(t['growth']))}%"
                 )
         lines.append("")
@@ -390,19 +328,103 @@ def format_trends(data: dict) -> str:
         ch_username = data["channel_map"].get(top.channel_id, "?")
         preview = _truncate(top.text or "", 80)
         url = f"https://t.me/{ch_username}/{top.tg_id}"
-        lines.append(
-            f'🔥 <b>Самый виральный:</b> <a href="{url}">«{html_mod.escape(preview)}»</a>'
-        )
-        lines.append(
-            f"   @{ch_username} · {_fmt_num(top.views or 0)} 👁 · "
-            f"{_fmt_num(top.reactions or 0)} ❤️"
-        )
+        lines.append(f"🔥 <b>Самый виральный:</b> @{ch_username}")
+        lines.append(f'<a href="{url}">«{html_mod.escape(preview)}»</a>')
+        lines.append(f"   {_post_metrics(top)}")
 
     return "\n".join(lines)
 
 
-class TrendsService:
-    """Сервис-фасад команды /trends: тренд-радар и форматирование."""
+def format_trends_rich(data: dict) -> str:
+    """Назначение: форматировать /trends в rich-HTML (структурная страница).
 
-    run_trends_pipeline = staticmethod(run_trends_pipeline)
-    format_trends = staticmethod(format_trends)
+    Блочные теги rich-сообщений рендерятся Telegram как страница; простой
+    format_trends остаётся fallback-ом для старых клиентов / ошибки API.
+    """
+    channel_count = len(data["channel_names"])
+    period_label = data["period_label"]
+
+    if data.get("empty"):
+        channels = " · ".join(f"@{html_mod.escape(n)}" for n in data["channel_names"])
+        return (
+            f"<h2>📡 Тренд-радар · {period_label}</h2>"
+            f"<p>📋 {channels}</p>"
+            "<p>Постов за этот период не найдено.</p>"
+        )
+
+    parts = [
+        f"<h2>📡 Тренд-радар · {period_label} · {_decline_channels(channel_count)}</h2>"
+    ]
+
+    rising = data.get("rising", [])
+    declining = data.get("declining", [])
+    new_topics = data.get("new_topics", [])
+
+    if rising:
+        parts.append("<h3>📈 Набирает обороты</h3>")
+        parts.append("<ul>")
+        for t in rising:
+            emoji = taxonomy.emoji_for(t["label"])
+            c1 = t.get("first_count", 0)
+            c2 = t.get("second_count", 0)
+            item = (
+                f"<li>{emoji} {html_mod.escape(taxonomy.label_for(t['label']))} — "
+                f"<b>+{round(t['growth'])}%</b> ({c1} → {_decline_posts(c2)})"
+            )
+            sample = t.get("sample_text")
+            if sample:
+                url = t.get("sample_url", "")
+                ch = t.get("sample_channel", "")
+                item += (
+                    f'<br>└ <a href="{url}">«{html_mod.escape(sample)}»</a> '
+                    f"@{html_mod.escape(ch)}"
+                )
+                sample_post = t.get("sample_post")
+                if sample_post is not None:
+                    item += f"<br>{_post_metrics(sample_post)}"
+            item += "</li>"
+            parts.append(item)
+        parts.append("</ul>")
+
+    if new_topics:
+        parts.append("<h3>🆕 Появилось впервые</h3>")
+        parts.append("<ul>")
+        for t in new_topics:
+            emoji = taxonomy.emoji_for(t["label"])
+            parts.append(
+                f"<li>{emoji} {html_mod.escape(taxonomy.label_for(t['label']))} · "
+                f"{_decline_posts(t['posts_count'])}</li>"
+            )
+        parts.append("</ul>")
+
+    if declining:
+        parts.append("<h3>📉 Затихло</h3>")
+        parts.append("<ul>")
+        for t in declining:
+            emoji = taxonomy.emoji_for(t["label"])
+            label = html_mod.escape(taxonomy.label_for(t["label"]))
+            if round(abs(t["growth"])) >= 100:
+                parts.append(f"<li>{emoji} {label} — исчезло из эфира</li>")
+            else:
+                parts.append(f"<li>{emoji} {label} — −{round(abs(t['growth']))}%</li>")
+        parts.append("</ul>")
+
+    if not rising and not declining and not new_topics:
+        parts.append(
+            "<p>Недостаточно данных для анализа трендов.<br>"
+            "Требуется минимум 3 упоминания темы за период.</p>"
+        )
+
+    top = data.get("top_viral")
+    if top is not None:
+        ch_username = data["channel_map"].get(top.channel_id, "?")
+        preview = _truncate(top.text or "", 80)
+        url = f"https://t.me/{html_mod.escape(ch_username)}/{top.tg_id}"
+        parts.append("<hr/>")
+        parts.append(
+            f"<p>🔥 <b>Самый виральный:</b> @{html_mod.escape(ch_username)}"
+            f'<br><a href="{url}">«{html_mod.escape(preview)}»</a>'
+            f"<br>{_post_metrics(top)}</p>"
+        )
+
+    return "".join(parts)

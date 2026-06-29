@@ -62,7 +62,7 @@ services:
       context: .
       dockerfile: tech_news_bot.Dockerfile
     image: tech_news_bot:${TAG:-latest}
-    container_name: tech_news_bot
+    container_name: bot
     restart: unless-stopped
     depends_on:
       postgres:

@@ -1,4 +1,5 @@
 """Настройка окружения перед запуском тестов."""
+
 import os
 import sys
 from unittest.mock import MagicMock
@@ -22,6 +23,10 @@ _mocks = [
     "cerebras.cloud",
     "cerebras.cloud.sdk",
     "telethon",
+    "telethon.tl",
+    "telethon.tl.functions",
+    "telethon.tl.functions.channels",
+    "telethon.tl.types",
     "chromadb",
     "redis",
     "aioredis",

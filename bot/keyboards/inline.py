@@ -1,19 +1,41 @@
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+# Главное меню: постоянная reply-клавиатура команд
 
-# ─── Digest: первый запуск (без кнопки Изменить) ────────
+ANALYZE_BTN = "📊 Анализ"
+DIGEST_BTN = "📰 Дайджест"
+TRENDS_BTN = "📈 Тренды"
+COMPARE_BTN = "⚖️ Сравнение"
 
-def digest_first_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="📋 Стандартный", callback_data="digest_list:default"),
-        InlineKeyboardButton(text="➕ Создать свой", callback_data="digest_list:create"),
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=ANALYZE_BTN), KeyboardButton(text=DIGEST_BTN)],
+            [KeyboardButton(text=TRENDS_BTN), KeyboardButton(text=COMPARE_BTN)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
     )
+
+
+# Универсальная кнопка «Назад»
+
+
+def back_keyboard(callback_data: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data=callback_data)
     return builder.as_markup()
 
 
-# ─── Digest: повторный запуск (быстрый запуск) ──────────
+# Digest: повторный запуск (быстрый запуск)
+
 
 def digest_quick_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -24,7 +46,8 @@ def digest_quick_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ─── Digest: выбор что именно изменить ──────────────────
+# Digest: выбор что именно изменить
+
 
 def digest_edit_choice_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -32,7 +55,9 @@ def digest_edit_choice_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📣 Каналы", callback_data="digest_edit:channels"),
     )
     builder.row(
-        InlineKeyboardButton(text="⏰ Расписание", callback_data="digest_edit:schedule"),
+        InlineKeyboardButton(
+            text="⏰ Расписание", callback_data="digest_edit:schedule"
+        ),
         InlineKeyboardButton(text="🔑 Фильтр", callback_data="digest_edit:filter"),
     )
     builder.row(
@@ -41,21 +66,27 @@ def digest_edit_choice_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ─── Digest: выбор списка каналов (устаревший, для edit) ─
+# Digest: выбор списка каналов (устаревший, для edit)
+
 
 def digest_list_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="📋 Стандартный", callback_data="digest_list:default"),
+        InlineKeyboardButton(
+            text="📋 Стандартный", callback_data="digest_list:default"
+        ),
     )
     builder.row(
         InlineKeyboardButton(text="✏️ Изменить", callback_data="digest_list:edit"),
-        InlineKeyboardButton(text="➕ Создать свой", callback_data="digest_list:create"),
+        InlineKeyboardButton(
+            text="➕ Создать свой", callback_data="digest_list:create"
+        ),
     )
     return builder.as_markup()
 
 
-# ─── Digest: выбор расписания ────────────────────────────
+# Digest: выбор расписания
+
 
 def schedule_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -72,7 +103,8 @@ def schedule_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ─── Digest: выбор дня недели ────────────────────────────
+# Digest: выбор дня недели
+
 
 def schedule_day_keyboard() -> InlineKeyboardMarkup:
     days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -80,10 +112,14 @@ def schedule_day_keyboard() -> InlineKeyboardMarkup:
     for i, day in enumerate(days):
         builder.button(text=day, callback_data=f"schedule_day:{i}")
     builder.adjust(4)
+    builder.row(
+        InlineKeyboardButton(text="← Назад", callback_data="schedule_day:back"),
+    )
     return builder.as_markup()
 
 
-# ─── Digest: выбор времени ───────────────────────────────
+# Digest: выбор времени
+
 
 def schedule_time_keyboard() -> InlineKeyboardMarkup:
     hours = [7, 8, 9, 10, 12, 15, 18, 21]
@@ -91,12 +127,16 @@ def schedule_time_keyboard() -> InlineKeyboardMarkup:
     for h in hours:
         builder.button(text=f"{h}:00", callback_data=f"schedule_time:{h}")
     builder.adjust(4)
+    builder.row(
+        InlineKeyboardButton(text="← Назад", callback_data="schedule_time:back"),
+    )
     return builder.as_markup()
 
 
-# ─── Digest: завершение редактирования каналов ──────────
+# Digest: завершение редактирования каналов
 
-def editing_done_keyboard() -> InlineKeyboardMarkup:
+
+def editing_done_keyboard(back: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="✅ Готово", callback_data="editing_done"),
@@ -104,18 +144,28 @@ def editing_done_keyboard() -> InlineKeyboardMarkup:
     builder.row(
         InlineKeyboardButton(text="🗑 Удалить каналы", callback_data="editing_remove"),
     )
+    if back:
+        builder.row(
+            InlineKeyboardButton(text="← Назад", callback_data="editing_back"),
+        )
     return builder.as_markup()
 
 
-# ─── Digest: выбор ключевых слов ────────────────────────
+# Digest: выбор ключевых слов
 
-def keywords_keyboard(topics: list[str], selected: list[str] | None = None) -> InlineKeyboardMarkup:
+
+def keywords_keyboard(
+    topics: list[str],
+    selected: list[str] | None = None,
+    show_topics: bool = True,
+) -> InlineKeyboardMarkup:
     selected = selected or []
     builder = InlineKeyboardBuilder()
-    for topic in topics[:8]:
-        label = f"✅ {topic}" if topic in selected else topic
-        builder.button(text=label, callback_data=f"keyword:{topic}")
-    builder.adjust(2)
+    if show_topics:
+        for topic in topics[:8]:
+            label = f"✅ {topic}" if topic in selected else topic
+            builder.button(text=label, callback_data=f"keyword:{topic}")
+        builder.adjust(2)
     builder.row(
         InlineKeyboardButton(text="✍️ Своё слово", callback_data="keyword:custom"),
         InlineKeyboardButton(text="🚫 Без фильтра", callback_data="keyword:none"),
@@ -123,60 +173,80 @@ def keywords_keyboard(topics: list[str], selected: list[str] | None = None) -> I
     builder.row(
         InlineKeyboardButton(text="✅ Готово", callback_data="keywords_done"),
     )
+    builder.row(
+        InlineKeyboardButton(text="← Назад", callback_data="keywords_back"),
+    )
     return builder.as_markup()
 
 
-# ─── Выбор периода (общий для digest, trends, compare) ──
+# Выбор периода (для trends и compare)
+
 
 def period_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="📅 24 часа", callback_data="period:1"),
         InlineKeyboardButton(text="📅 Неделя", callback_data="period:7"),
         InlineKeyboardButton(text="📅 Две недели", callback_data="period:14"),
     )
     return builder.as_markup()
 
 
-# ─── Digest: подтверждение ──────────────────────────────
+# Digest: подтверждение
 
-def confirmation_keyboard() -> InlineKeyboardMarkup:
+
+def confirmation_keyboard(saved: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="🚀 Сформировать", callback_data="confirm:go"),
         InlineKeyboardButton(text="✏️ Изменить", callback_data="confirm:edit"),
     )
+    if not saved:
+        builder.row(
+            InlineKeyboardButton(text="💾 Сохранить", callback_data="confirm:save"),
+        )
+    builder.row(
+        InlineKeyboardButton(text="← Назад", callback_data="confirm:back"),
+    )
     return builder.as_markup()
 
 
-# ─── Trends: быстрый запуск ─────────────────────────────
+# Trends: быстрый запуск
+
 
 def trends_quick_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="🚀 Запустить", callback_data="trends_quick:go"),
+        InlineKeyboardButton(text="🚀 Сформировать", callback_data="trends_quick:go"),
         InlineKeyboardButton(text="✏️ Изменить", callback_data="trends_quick:edit"),
     )
     return builder.as_markup()
 
 
-# ─── Trends: выбор списка каналов ───────────────────────
+# Trends: выбор списка каналов
+
 
 def trends_list_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="📋 Стандартный", callback_data="trends_list:default"),
+        InlineKeyboardButton(
+            text="📋 Стандартный", callback_data="trends_list:default"
+        ),
     )
     builder.row(
         InlineKeyboardButton(text="✏️ Изменить", callback_data="trends_list:edit"),
-        InlineKeyboardButton(text="➕ Создать свой", callback_data="trends_list:create"),
+        InlineKeyboardButton(
+            text="➕ Создать свой", callback_data="trends_list:create"
+        ),
     )
     return builder.as_markup()
 
 
-# ─── Compare: выбор каналов ─────────────────────────────
+# Compare: выбор каналов
 
-def compare_channels_keyboard(suggestions: list[tuple[str, str]] | None = None) -> InlineKeyboardMarkup:
+
+def compare_channels_keyboard(
+    suggestions: list[tuple[str, str]] | None = None,
+) -> InlineKeyboardMarkup:
     """Клавиатура выбора каналов для сравнения.
 
     suggestions: [(username, title), ...] — предложенные каналы из истории.
@@ -190,12 +260,15 @@ def compare_channels_keyboard(suggestions: list[tuple[str, str]] | None = None) 
             )
         builder.adjust(2)
     builder.row(
-        InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="compare_ch:manual"),
+        InlineKeyboardButton(
+            text="✍️ Ввести вручную", callback_data="compare_ch:manual"
+        ),
     )
     return builder.as_markup()
 
 
-# ─── Analyze: закрыть ввод ───────────────────────────────
+# Analyze: закрыть ввод
+
 
 def close_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
